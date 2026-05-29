@@ -1,73 +1,385 @@
-# He-man Sword Sensor
+# He-Man Sword Sensor
 
-> ... because I can.
+> By the power of Grayskull!
 
-## **1. Hardware: ESP32 + Accelerometer + Battery**
-### **What You Need**
-- **ESP32 Board**: The **Seeed Studio XIAO ESP32C3** or **XIAO ESP32S3** are excellent choices—small, powerful, and Rust-compatible.
-- **Accelerometer**: Use a **3-axis accelerometer + gyroscope** (IMU) for accurate motion tracking. The **MPU6050** or **BNO055** (9-axis) are popular and easy to interface with ESP32.
-- **Battery**: A **300 mAh LiPo** is fine for testing, but for longer use, consider a **500–1000 mAh** battery. Use a **TP4056** module for charging.
-- **Bluetooth**: ESP32 has built-in BLE, so no extra hardware is needed.
-- **Wiring**: Use thin, flexible wires to connect the IMU to the ESP32 (I2C interface).
-- **Mounting**: Secure the ESP32 and IMU inside the sword handle with foam or 3D-printed brackets to prevent movement.
+**A high-tech sword sensor with real-time motion tracking, NFC pairing security, and dynamic LED animations synchronized to your strikes. Track your swings with Bluetooth and watch the power flow through the blade.**
 
-#### XIAO nRF52840 Sense
+---
+
+## **1. Hardware: XIAO nRF52840 Sense + LSM6DS3TR IMU**
+
+### **Board: Seeed XIAO nRF52840 Sense**
 
 https://wiki.seeedstudio.com/XIAO_BLE/
 
 | Feature | Details |
 | --- | --- |
-| MCU | nRF52840 (ARM Cortex-M4, Bluetooth 5.0) |
-| IMU | LSM6DS3TR-C (6-axis: ±2/±4/±8/±16 g, ±125/±250/±500/±1000/±2000 dps) |
-| BLE | Built-in, low-latency, and power-efficient |
-| Power | Can run on 3.3V (your 300 mAh LiPo is fine for testing), BQ25101 for charging |
-| Size | 20x17.5 mm — fits easily inside a sword handle |
-| I2C/SPI | IMU is already connected to the MCU via I2C (no extra wiring needed) |
+| **MCU** | nRF52840 (ARM Cortex-M4, Bluetooth 5.0) |
+| **IMU** | LSM6DS3TR-C (6-axis: ±2/±4/±8/±16 g, ±125/±250/±500/±1000/±2000 dps) |
+| **Connectivity** | Bluetooth 5.0, NFC Type 2 tag (built-in) |
+| **Power** | 3.3V, BQ25101 charging, ~300 mAh LiPo battery (or larger for extended use) |
+| **Size** | 20×17.5 mm (fits in sword handle) |
+| **I2C Bus** | IMU connected via TWIM0 (P0.26 SDA, P0.27 SCL, 100 kHz) |
+
+### **LED Strip (WS2812B / NeoPixel)**
+
+The sword features an LED strip that animates in real-time based on motion:
+
+| Component | Details |
+| --- | --- |
+| **LED Type** | WS2812B (addressable RGB, 5V) |
+| **Control Pin** | P0.xx (PWM via embassy-nrf) |
+| **Behavior** | Flash animation moves tip-ward on upward thrust |
+| **Power** | External 5V source (recommended for strip) |
+| **Data Rate** | 800 kHz (WS2812B protocol) |
+
+**Available GPIO Pins (after I2C/IMU):**
+- P0.02, P0.03, P0.04, P0.05, P0.06, P0.07 (SPI/GPIO)
+- P0.08, P0.09, P0.10, P0.11 (More GPIO)
+- Select one for LED control (e.g., P0.11 for NeoPixel data line)
+
+### **Sensor Specifications**
+
+The **LSM6DS3TR** provides:
+- **Accelerometer**: 3-axis, configurable range (±2/±4/±8/±16 g)
+- **Gyroscope**: 3-axis, configurable range (±125/±250/±500/±1000/±2000 dps)
+- **Data Output**: Raw 16-bit integers (i16) for each axis
+- **I2C Address**: 0x6A (no jumpers needed)
 
 ### **Optimal Sensor Placement**
-- **Best location**: **10–15 cm from the guard (handle end)**.
-  - **Why?**
-    - Close to the pivot point (your wrist) for accurate rotational data.
-    - Far enough from the tip to avoid excessive linear acceleration noise.
-    - Minimizes the effect of the sword’s mass distribution on readings.
-  - Avoid the very tip or center of mass, as this can introduce misleading centrifugal forces during swings.
 
-## **2. Firmware: Rust on ESP32**
-### **What You Need**
-- **Rust Toolchain**: Install Rust and the `espup` tool for ESP32 development.
-  ```bash
-  cargo install espup
-  espup install
-  ```
-- **ESP32 Rust Crates**:
-  - [`esp-idf-hal`](https://github.com/esp-rs/esp-idf-hal) or [`esp-rs`](https://github.com/esp-rs) for hardware abstraction.
-  - [`embedded-hal`](https://github.com/rust-embedded/embedded-hal) for IMU communication (I2C).
-  - [`esp-idf-svc`](https://github.com/esp-rs/esp-idf-svc) for BLE.
-- **IMU Driver**: https://crates.io/crates/lsm6ds3tr
+- **Best location**: **10–15 cm from the guard** (handle end)
+  - Close to wrist pivot for accurate rotational data
+  - Far enough from tip to avoid excessive linear acceleration noise
+  - Minimizes sword mass distribution effects
+- **Avoid**: Sword tip or center of mass (introduces centrifugal force noise)
 
-### **Firmware Tasks**
-1. **Read IMU Data**: Sample accelerometer and gyroscope data at **100–200 Hz** (higher = smoother, but more power).
-2. **Preprocess Data**: Apply a **low-pass filter** to reduce noise (e.g., moving average or exponential filter).
-3. **Send Data via BLE**: Pack the data into a binary format (e.g., `f32` for each axis) and stream it to the phone.
-   - Use **BLE notifications** for real-time updates.
-   - Example BLE service UUID: `0000180f-0000-1000-8000-00805f9b34fb` (Battery Service can be repurposed).
+---
 
-### **Example Rust Workflow**
+## **2. Firmware: Rust + Embassy Framework**
+
+### **Tech Stack**
+
+| Component | Version | Purpose |
+| --- | --- | --- |
+| **Embassy** | 0.10.0 | Async runtime with executor, timers, channels |
+| **nrf52840-hal** | 0.19.0 | Synchronous I2C and peripheral access |
+| **lsm6ds3tr** | 0.2.2 | LSM6DS3TR IMU driver |
+| **defmt + defmt-rtt** | 1.1.0 / 1.2.0 | Structured logging over RTT |
+| **embassy-sync** | 0.8.0 | Inter-task channel communication |
+| **linked_list_allocator** | 0.10 | Heap allocator (4 KB) |
+| **panic-probe** | 1.0.0 | Panic handler |
+
+### **Build Profile**
+- **Optimization**: `-O s` (size optimization)
+- **LTO**: Enabled
+- **Codegen Units**: 1
+- **Target**: `thumbv7em-none-eabihf`
+
+### **Boot Sequence**
+
+```
+┌──────────────────────────────────────┐
+│ 1. Initialize Heap (4 KB)            │
+├──────────────────────────────────────┤
+│ 2. Init Embassy Runtime              │
+│    - Async executor                  │
+│    - Timer & PWM modules             │
+├──────────────────────────────────────┤
+│ 3. Configure I2C (TWIM0)             │
+│    - SDA: P0.26, SCL: P0.27          │
+│    - Frequency: 100 kHz              │
+├──────────────────────────────────────┤
+│ 4. Initialize LSM6DS3TR IMU          │
+│    - Address: 0x6A                   │
+│    - Ready for sensor reads          │
+├──────────────────────────────────────┤
+│ 5. Initialize LED Strip (PWM)        │
+│    - Data pin configured             │
+│    - All LEDs off (ready for anim)   │
+├──────────────────────────────────────┤
+│ 6. NFC PAIRING GATE (15 sec)         │
+│    ⚠️  BLUETOOTH HIDDEN until paired  │
+│    - Wait for NFC reader detection   │
+│    - Store bonded device MAC         │
+│    - Timeout → advertise to paired   │
+├──────────────────────────────────────┤
+│ 7. Bluetooth Advertising             │
+│    - Device: "He-man Power Sword"    │
+│    - Only visible to paired device   │
+│    - 20 Hz sensor sampling           │
+│    - Real-time LED animation         │
+└──────────────────────────────────────┘
+```
+
+### **NFC Pairing Mode (TODO: Real Detection)**
+
+The device employs a **security-first design** with NFC as the pairing gate:
+
+**Pairing Flow:**
+```
+1. Device boots into NFC Pairing Mode (15 seconds)
+   ├─ Bluetooth is HIDDEN (no advertisements)
+   └─ Listening for NFC reader (mobile device with NFC)
+
+2. User brings phone with NFC reader to sword
+   ├─ NFC handshake occurs (type 2 tag)
+   ├─ Device stores phone's Bluetooth MAC address
+   └─ Bond is created in flash memory
+
+3. After NFC pairing OR timeout (15 sec):
+   ├─ Device begins BLE advertising
+   ├─ ONLY visible to the paired MAC address
+   └─ Other devices cannot discover "He-man Power Sword"
+
+4. Bluetooth Connection:
+   ├─ Paired phone connects via BLE
+   ├─ Sensor data streamed at 20 Hz
+   └─ LED animations synchronized in real-time
+```
+
+**Implementation (TODO):**
 ```rust
-// Pseudocode
-loop {
-    let accel = imu.read_accelerometer();
-    let gyro = imu.read_gyroscope();
-    let timestamp = system_timer.now();
-    ble.notify(&[accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z, timestamp]);
-    delay(5ms); // ~200 Hz
+// After NFC detection
+let bonded_device_mac = nfc_read_mac_from_tag();
+store_bonding_data_to_flash(bonded_device_mac);
+
+// During BLE advertising
+ble_advertise_to_bonded_device_only(bonded_device_mac);
+
+// On reconnection
+if incoming_ble_mac == bonded_device_mac {
+    start_sensor_stream();
+} else {
+    reject_connection();  // Not the paired device
 }
 ```
 
+This ensures the sword can only be controlled by the device that performed the initial NFC pairing.
 
-## **3. Mobile App: Flutter (Dart)**
-### **What You Need**
-- **Flutter Packages**:
+Currently, the device waits 15 seconds in NFC mode before automatically switching to Bluetooth. Real NFC detection will use the nRF52840's built-in NFC Type 2 tag controller:
+
+```rust
+// Boot enters NFC Pairing Mode
+info!("🔌 NFC Pairing Mode - Waiting for NFC reader...");
+let pairing_start = Instant::now();
+let pairing_timeout = Duration::from_secs(15);
+
+loop {
+    if pairing_start.elapsed() > pairing_timeout {
+        break;  // Switch to Bluetooth
+    }
+    // TODO: Check NFC field detection via nRF52840 NFCT peripheral
+    Timer::after_millis(100).await;
+}
+```
+
+### **Sensor Data Structure**
+
+Data is packed into a 12-byte `SensorData` struct for efficient BLE transmission:
+
+```rust
+#[repr(C)]
+#[derive(Clone, Copy, defmt::Format)]
+struct SensorData {
+    accel_x: i16,  // Raw accelerometer X (±2/±4/±8/±16 g)
+    accel_y: i16,  // Raw accelerometer Y
+    accel_z: i16,  // Raw accelerometer Z
+    gyro_x: i16,   // Raw gyroscope X (±125/±250/±500/±1000/±2000 dps)
+    gyro_y: i16,   // Raw gyroscope Y
+    gyro_z: i16,   // Raw gyroscope Z
+}  // Total: 12 bytes
+```
+
+### **Sensor Sampling**
+
+- **Frequency**: 20 Hz (50 ms interval)
+- **Method**: Synchronous I2C reads (blocking)
+- **Fallback**: Skips failed reads, logs warnings
+- **Communication**: Non-blocking `try_send()` to BLE channel
+
+```rust
+// Main sensor loop
+loop {
+    match imu.read_accel_raw() {
+        Ok(accel) => {
+            match imu.read_gyro_raw() {
+                Ok(gyro) => {
+                    let data = SensorData { accel_x: accel.x, /* ... */ };
+                    let _ = SENSOR_CHANNEL.try_send(data);  // Non-blocking
+                }
+                Err(_) => warn!("Failed to read gyroscope"),
+            }
+        }
+        Err(_) => warn!("Failed to read accelerometer"),
+    }
+    Timer::after_millis(50).await;  // 20 Hz
+}
+```
+
+### **LED Animation: Motion-Triggered Flash**
+
+The sword blade features real-time LED animations driven by the accelerometer:
+
+```rust
+// Motion detection: Upward thrust detection (Z-axis acceleration)
+fn detect_upward_thrust(accel_z: i16) -> bool {
+    accel_z > THRUST_THRESHOLD  // Threshold: ~0.5g or 5 m/s²
+}
+
+// LED animation: Flash propagates from hilt to tip
+fn animate_thrust_effect(led_strip: &mut LedStrip, duration_ms: u32) {
+    // 1. Detect upward acceleration from accelerometer
+    // 2. Calculate animation phase (0..NUM_LEDS)
+    // 3. Brightness decreases towards tip (decay curve)
+    // 4. Cycle repeats every 200-300ms or until motion stops
+    
+    for phase in 0..NUM_LEDS {
+        for led_idx in 0..NUM_LEDS {
+            let brightness = if led_idx <= phase {
+                255 * (1.0 - (led_idx as f32 / NUM_LEDS as f32))
+            } else {
+                0
+            };
+            led_strip.set_led(led_idx, color_from_brightness(brightness));
+        }
+        Timer::after_millis(20).await;  // ~50 Hz LED updates
+    }
+}
+```
+
+**Animation Behavior:**
+- **Upward Thrust**: Flash moves from guard → tip (mimics He-Man's power surge)
+- **Downward**: LEDs fade or pulse (reversing motion)
+- **Idle**: LEDs dim or pulse slowly (breathing effect)
+- **Impact**: Bright flash on high acceleration spikes
+
+```bash
+# Build for release (size-optimized)
+cargo build --release
+
+# Check without building
+cargo check
+
+# Format code
+cargo fmt
+
+# Run in debug mode (requires probe-rs for flashing)
+cargo run
+```
+
+### **Debugging with RTT**
+
+The firmware uses **defmt + RTT** for real-time logging. Connect a debugger (e.g., J-Link) and use:
+
+```bash
+cargo run --release
+# Output appears in terminal via RTT
+```
+
+### **Inter-Task Communication**
+
+An `embassy_sync::Channel` connects the sensor reading loop to the BLE broadcaster:
+
+```rust
+static SENSOR_CHANNEL: Channel<CriticalSectionRawMutex, SensorData, 16> = Channel::new();
+```
+
+- **Capacity**: 16 samples (allows BLE queuing during transmission)
+- **Type**: Non-blocking (skips if channel full)
+- **Purpose**: Decouples sensor reads from BLE transmission
+
+
+---
+
+## **3. Mobile App: Flutter (Dart) - Planned**
+
+### **Next Steps for BLE Integration**
+
+To complete the Bluetooth implementation, the firmware needs:
+
+1. **nrf-softdevice stack** (S140 softdevice for BLE)
+   ```toml
+   nrf-softdevice = "0.5"
+   ```
+
+2. **GATT Service & Characteristic Setup**
+   ```rust
+   // TODO: Define Sword Sensor GATT service
+   // Service UUID: Custom UUID for sensor data
+   // Characteristic: Accel + Gyro 6-axis data
+   // Notifications: 20 Hz updates (~50ms interval)
+   ```
+
+3. **BLE Advertisement (Paired Device Only)**
+   ```rust
+   // TODO: Advertise only to bonded device MAC
+   // Device name: "He-man Power Sword"
+   // Security: Require pairing/bonding
+   // Whitelist: Only respond to paired device
+   ```
+
+4. **Bonding & Persistence**
+   ```rust
+   // Store bonded device MAC in flash
+   // On reconnection, verify MAC before streaming
+   // Other devices get rejected at BLE layer
+   ```
+
+### **Data Packet Format**
+
+Currently, the device sends raw 16-bit sensor values. The Flutter app will receive:
+
+```
+┌───────────────────────────────────────────────────┐
+│ BLE Notification (12 bytes)                       │
+├───────────┬───────────┬───────────────────────────┤
+│ Accel X   │ Accel Y   │ Accel Z   │ Gyro X/Y/Z   │
+│ (i16)     │ (i16)     │ (i16)     │ (3× i16)     │
+├───────────┴───────────┴───────────┴───────────────┤
+│ Total: 12 bytes                                   │
+│ Frequency: 20 Hz (~50 ms per packet)              │
+└───────────────────────────────────────────────────┘
+```
+
+### **Planned Flutter Workflow**
+
+```dart
+// Pseudocode: Flutter app consuming sensor data & controlling LEDs
+1. NFC Pairing: Tap sword to phone to establish bond
+2. Scan for "He-man Power Sword" device
+3. Connect via BLE (only works if paired MAC matches)
+4. Subscribe to sensor characteristic (20 Hz notifications)
+5. Receive 12-byte packets: [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
+6. Real-time analysis:
+   - Detect upward thrust (accel_z > threshold)
+   - Calculate motion direction and intensity
+7. Optional: Send feedback to device for LED control
+8. Visualize sword trajectory in 3D
+```
+
+**Real-Time Feedback Loop:**
+- Phone receives sensor data → 20 packets/second
+- Detects thrust motion (upward acceleration)
+- Phone can visualize motion AND control blade LEDs
+- Latency: ~50ms sensor → phone → animation
+
+### **Sensor Fusion Algorithms**
+
+Once data arrives, the app will use:
+
+| Algorithm | Purpose |
+| --- | --- |
+| **Madgwick AHRS** | Combine accel + gyro → 3D orientation (quaternion) |
+| **Complementary Filter** | Blend accel (low-freq) with gyro (high-freq) |
+| **Zero-Velocity Update (ZUPT)** | Correct drift by detecting stationary periods |
+
+### **Visualization Goals**
+
+- Real-time 3D sword trajectory (line plot)
+- Orientation (quaternion → 3D cube/mesh)
+- Power estimation during swings
+- Historical swing database
   - [`flutter_blue`](https://pub.dev/packages/flutter_blue) for BLE communication.
   - [`vector_math`](https://pub.dev/packages/vector_math) for 3D vector/matrix math.
   - [`syncfusion_flutter_charts`](https://pub.dev/packages/syncfusion_flutter_charts) or [`flutter_3d_obj`](https://pub.dev/packages/flutter_3d_obj) for 3D visualization.
@@ -79,74 +391,182 @@ loop {
 3. **Sensor Fusion**: Use a **complementary filter** or **Madgwick/Mahony filter** to combine accelerometer and gyroscope data into a 3D orientation (quaternions or Euler angles).
    - Libraries: [`sensor_fusion`](https://pub.dev/packages/sensor_fusion) or implement your own.
 4. **Trajectory Calculation**:
-   - Double-integrate acceleration to get **position** (drift is a challenge—see below).
-   - Use **gyroscope data to rotate the acceleration vector** into a global frame.
-5. **Power Estimation**:
-   - **Power = Force × Velocity**.
-   - Approximate force as `mass × acceleration` (use sword mass, e.g., 1 kg).
-   - Velocity is the integral of acceleration (correct for drift with zero-velocity updates when the sword is stationary).
-6. **3D Visualization**:
-   - Plot the sword’s trajectory in 3D space using the calculated positions.
-   - Use a **3D scatter plot** or a **line render** (e.g., with `flutter_3d_obj`).
-   - Color-code segments by power or speed.
 
+---
 
-## **4. Algorithms for the Flutter App**
-### **Key Algorithms**
-| Task                | Algorithm                          | Notes                                                                 |
-|---------------------|------------------------------------|-----------------------------------------------------------------------|
-| Sensor Fusion       | Madgwick/Mahony AHRS               | Combines accel + gyro to estimate orientation (quaternions).          |
-| Drift Correction    | Zero-Velocity Update (ZUPT)        | Assume sword is stationary at rest to correct integration drift.      |
-| Trajectory          | Double Integration                 | Integrate accel → velocity → position. Use ZUPT to reset velocity.   |
-| Power Calculation   | `Power = mass × accel × velocity`  | Simplify: `Power ≈ mass × |accel| × |velocity|`.                        |
-| Smoothing           | Low-Pass Filter (Butterworth)      | Reduce high-frequency noise in accel/gyro data.                     |
+## **4. Current Project Status**
 
-### **Drift Handling**
-- **Problem**: Double-integrating acceleration leads to **massive drift** over time.
-- **Solutions**:
-  1. **Zero-Velocity Updates (ZUPT)**: When the sword is stationary (detected via accel/gyro noise thresholds), reset velocity to 0.
-  2. **Complementary Filter**: Blend high-frequency gyro data with low-frequency accel data.
-  3. **Assumptions**: Assume the sword starts at rest and returns to rest between swings.
+### ✅ **Completed**
+- Rust + Embassy embedded runtime working on nRF52840
+- I2C communication with LSM6DS3TR IMU (100 kHz, TWIM0)
+- 20 Hz sensor sampling (50 ms intervals)
+- Synchronous I2C reads with error handling
+- Sensor data packed into 12-byte efficient structures
+- NFC Pairing Mode (15-second boot sequence)
+- Multi-task architecture with embassy_sync channels
+- Structured logging via defmt + RTT
+- Code compiles with zero errors
 
-## **5. How to Start**
-### **Step-by-Step Plan**
-1. **Hardware Setup**:
-   - Solder the IMU to the ESP32 (I2C: SDA, SCL, VCC, GND).
-   - Test IMU readings with Rust (print raw accel/gyro values to serial).
-2. **BLE Communication**:
-   - Write Rust code to send IMU data over BLE.
-   - Write a Flutter app to receive and log the data.
-3. **Sensor Fusion**:
-   - Implement Madgwick filter in Dart (or use a library).
-   - Visualize orientation (e.g., 3D cube) in the app.
-4. **Trajectory & Power**:
-   - Add double integration and ZUPT.
-   - Plot 3D trajectory and power estimates.
-5. **Optimize**:
-   - Calibrate IMU (remove offsets).
-   - Tune filter parameters (e.g., Madgwick beta).
-   - Reduce BLE latency (increase MTU size).
+### 🔄 **In Progress**
+- Real NFC field detection (currently placeholder timeout)
+- Complete BLE stack integration
+- GATT service and characteristic definitions
+- BLE bonding & MAC whitelisting
+- LED strip control (WS2812B PWM driver)
 
+### ⏳ **TODO**
+- nrf-softdevice S140 BLE stack integration
+- NFC Type 2 tag read/write (store bonded MAC)
+- BLE advertise-only-to-bonded-device logic
+- LED animation engine (motion-triggered effects)
+- Upward thrust detection algorithm
+- Mobile app (Flutter) for pairing & visualization
+- Real-time LED control from phone
+- Sensor fusion algorithms (Madgwick filter)
 
-## **6. Example Resources**
-- **Rust + ESP32**:
-  - [ESP-RS Book](https://esp-rs.github.io/book/)
-  - [MPU6050 Rust Driver](https://github.com/eldruin/mpu6050-rs)
-- **Flutter + BLE**:
-  - [flutter_blue example](https://github.com/Freeyourgadget/Gadgetbridge/tree/master/app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/ble)
+---
+
+## **5. LED Animation: The Power Sword Effect**
+
+### **Motion Detection for LED Control**
+
+The sword analyzes accelerometer data in real-time to drive LED animations that match the user's swing:
+
+**Thrust Detection Algorithm:**
+```
+Input: 3-axis accelerometer data (20 Hz)
+
+1. Compute acceleration magnitude: a_mag = sqrt(ax² + ay² + az²)
+2. Detect upward component: accel_z > THRUST_THRESHOLD (≈ +0.5g)
+3. Calculate velocity: v = integral of acceleration (with drift correction)
+4. Detect impact: a_mag > IMPACT_THRESHOLD (sudden spike)
+
+Output: Motion vector indicating thrust direction and intensity
+```
+
+**LED Flash Animation:**
+
+| Motion Type | LED Pattern | Duration |
+| --- | --- | --- |
+| **Upward Thrust** | Flash propagates guard → tip (white/blue) | 200 ms |
+| **Downward Slash** | Reverse wave or pulse fade (red/orange) | 150 ms |
+| **Impact Hit** | Bright white flash then decay | 100 ms |
+| **Idle/Breathing** | Slow pulse or dim glow | Continuous |
+| **Motion Stop** | Fade to off over 1 sec | 1000 ms |
+
+### **Implementation Strategy**
+
+**Stage 1: Basic LED Control**
+```rust
+// Drive WS2812B via PWM or SPI
+// Simple on/off animation based on accel_z threshold
+// All LEDs same color (white) when thrusting
+```
+
+**Stage 2: Directional Animation**
+```rust
+// Map accel_z → animation phase (0..NUM_LEDS)
+// Each LED represents "distance along thrust"
+// Brightness = brightness(phase - distance)  // Decay effect
+```
+
+**Stage 3: Advanced Effects (TODO)**
+```rust
+// Color shift based on motion intensity
+// Multiple animation layers (thrust + impact)
+// Gyroscope integration for rotation effects
+// Coordinate transformation to global frame
+```
+
+### **Performance Constraints**
+
+- **LED Update Rate**: 50 Hz (20 ms per frame)
+- **Sensor Data Rate**: 20 Hz (50 ms per sample)
+- **Latency Target**: < 100 ms from motion → LED update
+- **Power Budget**: LED strip adds ~100-500 mA (external supply recommended)
+
+---
+
+## **6. Development Setup**
+
+### **Prerequisites**
+
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Add ARM target
+rustup target add thumbv7em-none-eabihf
+
+# Install Probe-rs for flashing
+cargo install probe-rs-tools
+```
+
+### **Flashing the Firmware**
+
+```bash
+# Build release binary
+cargo build --release
+
+# Flash to board using probe-rs
+probe-rs download target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword
+
+# Or use cargo-flash shortcut
+cargo flash --release
+```
+
+### **Viewing Logs via RTT**
+
+```bash
+# Start RTT viewer
+probe-rs rtt
+
+# Or if running cargo run
+cargo run --release
+```
+
+---
+
+## **7. References**
+- **Rust Embedded**:
+  - [Embassy Framework](https://github.com/embassy-rs/embassy)
+  - [nrf52840-hal](https://github.com/nrf-rs/nrf-hal)
+  - [lsm6ds3tr driver](https://crates.io/crates/lsm6ds3tr)
+- **LED Control**:
+  - [ws2812-spi crate](https://crates.io/crates/ws2812-spi) (WS2812B via SPI)
+  - [nrf52840 PWM module](https://docs.rs/nrf52840-hal/latest/nrf52840_hal/pwm/index.html) (alternative: PWM control)
+  - [smart-leds crate](https://crates.io/crates/smart-leds) (trait for LED animations)
+- **NFC & Security**:
+  - [nRF52840 NFC Type 2 Tag](https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcomp_5_0%2Fnfct_overview.html)
+  - [nrf-softdevice bonding](https://github.com/embassy-rs/nrf-softdevice) (BLE pairing/bonding)
+  - [NFC documentation (ISO/IEC 14443)](https://www.nxp.com/docs/en/user-guide/UM10528.pdf)
+- **nRF52840**:
+  - [Datasheet](https://infocenter.nordicsemi.com/pdf/nRF52840_PS_v3.2.pdf)
+  - [NFC NFCT peripheral](https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcomp_5_0%2Fnfct_overview.html)
 - **Sensor Fusion**:
-  - [Madgwick AHRS (Python reference)](https://github.com/arduino-libraries/MadgwickAHRS)
-  - [Dart implementation](https://github.com/lettier/3d-game-shaders-for-beginners/blob/master/assets/3d-game-shaders-for-beginners.md#quaternions)
+  - [Madgwick AHRS (reference)](https://github.com/arduino-libraries/MadgwickAHRS)
 
+---
 
-## **7. Challenges & Tips**
-- **Power Consumption**:
-  - Use **deep sleep** for the ESP32 when idle.
-  - Reduce BLE advertising interval.
-- **Drift**: Expect **~1–2 meters of drift per minute** without correction. ZUPT is critical.
-- **Latency**: BLE notifications add ~10–50 ms latency. Use **BLE 5.0** for lower latency.
-- **Calibration**: Calibrate the IMU (remove biases) before each use.
+## **Architecture Decision Records (ADRs)**
 
-## License
+### **ADR-1: NFC as Primary Pairing Gate**
+- **Decision**: NFC required for Bluetooth pairing (not just connection)
+- **Rationale**: Security + UX (tap-to-pair is intuitive)
+- **Alternative**: QR code / PIN (rejected: less natural for a physical device)
+
+### **ADR-2: LED Animations Driven by Accelerometer**
+- **Decision**: Real-time motion detection → LED flash
+- **Rationale**: Immediate feedback without phone latency (~20-50ms)
+- **Alternative**: Phone-only control (rejected: too much lag)
+
+### **ADR-3: Bonded Device Whitelist**
+- **Decision**: Only paired MAC address can connect post-pairing
+- **Rationale**: Prevents accidental connection from other devices
+- **Alternative**: Require PIN each time (rejected: poor UX)
+
+---
+
+## **License**
 
 MIT

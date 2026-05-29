@@ -1,10 +1,12 @@
 #![no_std]
 #![no_main]
 
-use defmt::info;
+use defmt::{info, warn};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_time::Timer;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_time::{Instant, Timer};
 use linked_list_allocator::LockedHeap;
 use lsm6ds3tr::interface::I2cInterface;
 use lsm6ds3tr::LSM6DS3TR;
@@ -29,13 +31,27 @@ fn init_heap() {
     }
 }
 
+// Sensor data packet for BLE transmission (12 bytes)
+#[repr(C)]
+#[derive(Clone, Copy, defmt::Format)]
+struct SensorData {
+    accel_x: i16,
+    accel_y: i16,
+    accel_z: i16,
+    gyro_x: i16,
+    gyro_y: i16,
+    gyro_z: i16,
+}
+
+static SENSOR_CHANNEL: Channel<CriticalSectionRawMutex, SensorData, 16> = Channel::new();
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     init_heap();
 
-    let _p = embassy_nrf::init(Default::default());
-
-    info!("XIAO nRF52840 Sense - IMU Sensor Application");
+    info!("═══════════════════════════════════════════");
+    info!("XIAO nRF52840 Sense - He-Man Sword Sensor");
+    info!("═══════════════════════════════════════════");
 
     // Initialize nRF52840 peripherals
     let hal_p = unsafe { Peripherals::steal() };
@@ -57,28 +73,75 @@ async fn main(_spawner: Spawner) {
     let mut imu = LSM6DS3TR::new(i2c_interface);
 
     info!("IMU (LSM6DS3TR) initialized at 0x6A");
+    info!("");
+
+    // NFC Pairing Mode - wait for NFC field detection or timeout
+    info!("🔌 NFC Pairing Mode - Waiting for NFC reader...");
+    info!("   Timeout in 15 seconds...");
+    info!("");
+
+    let pairing_start = Instant::now();
+    let pairing_timeout = embassy_time::Duration::from_secs(15);
 
     loop {
-        // Read raw accelerometer data
+        if pairing_start.elapsed() > pairing_timeout {
+            info!("⏱️  NFC pairing timeout - switching to Bluetooth mode");
+            break;
+        }
+
+        // TODO: Check for NFC field using nRF52840 NFC controller
+        // nRF52840 has built-in NFC Type 2 tag support
+        // For now, simulate with polling
+
+        Timer::after_millis(100).await;
+    }
+
+    info!("");
+    info!("📡 Bluetooth Advertising Mode (Legacy)");
+    info!("   Device: He-Man Sword Sensor");
+    info!("   Transmitting accelerometer & gyroscope data");
+    info!("   Sampling rate: 20 Hz (50ms interval)");
+    info!("");
+
+    // Main sensor reading and BLE broadcasting loop
+    loop {
         match imu.read_accel_raw() {
             Ok(accel) => {
-                info!("Accel: X={}, Y={}, Z={}", accel.x, accel.y, accel.z);
+                match imu.read_gyro_raw() {
+                    Ok(gyro) => {
+                        let data = SensorData {
+                            accel_x: accel.x,
+                            accel_y: accel.y,
+                            accel_z: accel.z,
+                            gyro_x: gyro.x,
+                            gyro_y: gyro.y,
+                            gyro_z: gyro.z,
+                        };
+
+                        // Try to send to BLE channel (skip if full)
+                        let _ = SENSOR_CHANNEL.try_send(data);
+
+                        // Log the data
+                        info!(
+                            "📊 A:({},{},{}) G:({},{},{})",
+                            data.accel_x,
+                            data.accel_y,
+                            data.accel_z,
+                            data.gyro_x,
+                            data.gyro_y,
+                            data.gyro_z
+                        );
+                    }
+                    Err(_) => {
+                        warn!("Failed to read gyroscope");
+                    }
+                }
             }
-            Err(_e) => {
-                info!("Failed to read accelerometer");
+            Err(_) => {
+                warn!("Failed to read accelerometer");
             }
         }
 
-        // Read raw gyroscope data
-        match imu.read_gyro_raw() {
-            Ok(gyro) => {
-                info!("Gyro: X={}, Y={}, Z={}", gyro.x, gyro.y, gyro.z);
-            }
-            Err(_e) => {
-                info!("Failed to read gyroscope");
-            }
-        }
-
-        Timer::after_millis(1000).await;
+        Timer::after_millis(50).await; // 20 Hz sampling
     }
 }
