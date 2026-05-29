@@ -11,6 +11,19 @@
 - **Wiring**: Use thin, flexible wires to connect the IMU to the ESP32 (I2C interface).
 - **Mounting**: Secure the ESP32 and IMU inside the sword handle with foam or 3D-printed brackets to prevent movement.
 
+#### XIAO nRF52840 Sense
+
+https://wiki.seeedstudio.com/XIAO_BLE/
+
+| Feature | Details |
+| --- | --- |
+| MCU | nRF52840 (ARM Cortex-M4, Bluetooth 5.0) |
+| IMU | LSM6DS3TR-C (6-axis: ±2/±4/±8/±16 g, ±125/±250/±500/±1000/±2000 dps) |
+| BLE | Built-in, low-latency, and power-efficient |
+| Power | Can run on 3.3V (your 300 mAh LiPo is fine for testing), BQ25101 for charging |
+| Size | 20x17.5 mm — fits easily inside a sword handle |
+| I2C/SPI | IMU is already connected to the MCU via I2C (no extra wiring needed) |
+
 ### **Optimal Sensor Placement**
 - **Best location**: **10–15 cm from the guard (handle end)**.
   - **Why?**
@@ -30,7 +43,7 @@
   - [`esp-idf-hal`](https://github.com/esp-rs/esp-idf-hal) or [`esp-rs`](https://github.com/esp-rs) for hardware abstraction.
   - [`embedded-hal`](https://github.com/rust-embedded/embedded-hal) for IMU communication (I2C).
   - [`esp-idf-svc`](https://github.com/esp-rs/esp-idf-svc) for BLE.
-- **IMU Driver**: Use a Rust crate like [`mpu6050`](https://crates.io/crates/mpu6050) or write your own I2C driver for the BNO055.
+- **IMU Driver**: https://crates.io/crates/lsm6ds3tr
 
 ### **Firmware Tasks**
 1. **Read IMU Data**: Sample accelerometer and gyroscope data at **100–200 Hz** (higher = smoother, but more power).
