@@ -12,28 +12,29 @@
 
 https://wiki.seeedstudio.com/XIAO_BLE/
 
-| Feature | Details |
-| --- | --- |
-| **MCU** | nRF52840 (ARM Cortex-M4, Bluetooth 5.0) |
-| **IMU** | LSM6DS3TR-C (6-axis: ±2/±4/±8/±16 g, ±125/±250/±500/±1000/±2000 dps) |
-| **Connectivity** | Bluetooth 5.0, NFC Type 2 tag (built-in) |
-| **Power** | 3.3V, BQ25101 charging, ~300 mAh LiPo battery (or larger for extended use) |
-| **Size** | 20×17.5 mm (fits in sword handle) |
-| **I2C Bus** | IMU connected via TWIM0 (P0.26 SDA, P0.27 SCL, 100 kHz) |
+| Feature          | Details                                                                    |
+| ---------------- | -------------------------------------------------------------------------- |
+| **MCU**          | nRF52840 (ARM Cortex-M4, Bluetooth 5.0)                                    |
+| **IMU**          | LSM6DS3TR-C (6-axis: ±2/±4/±8/±16 g, ±125/±250/±500/±1000/±2000 dps)       |
+| **Connectivity** | Bluetooth 5.0, NFC Type 2 tag (built-in)                                   |
+| **Power**        | 3.3V, BQ25101 charging, ~300 mAh LiPo battery (or larger for extended use) |
+| **Size**         | 20×17.5 mm (fits in sword handle)                                          |
+| **I2C Bus**      | IMU connected via TWIM0 (P0.26 SDA, P0.27 SCL, 100 kHz)                    |
 
 ### **LED Strip (WS2812B / NeoPixel)**
 
 The sword features an LED strip that animates in real-time based on motion:
 
-| Component | Details |
-| --- | --- |
-| **LED Type** | WS2812B (addressable RGB, 5V) |
-| **Control Pin** | P0.xx (PWM via embassy-nrf) |
-| **Behavior** | Flash animation moves tip-ward on upward thrust |
-| **Power** | External 5V source (recommended for strip) |
-| **Data Rate** | 800 kHz (WS2812B protocol) |
+| Component       | Details                                         |
+| --------------- | ----------------------------------------------- |
+| **LED Type**    | WS2812B (addressable RGB, 5V)                   |
+| **Control Pin** | P0.xx (PWM via embassy-nrf)                     |
+| **Behavior**    | Flash animation moves tip-ward on upward thrust |
+| **Power**       | External 5V source (recommended for strip)      |
+| **Data Rate**   | 800 kHz (WS2812B protocol)                      |
 
 **Available GPIO Pins (after I2C/IMU):**
+
 - P0.02, P0.03, P0.04, P0.05, P0.06, P0.07 (SPI/GPIO)
 - P0.08, P0.09, P0.10, P0.11 (More GPIO)
 - Select one for LED control (e.g., P0.11 for NeoPixel data line)
@@ -41,6 +42,7 @@ The sword features an LED strip that animates in real-time based on motion:
 ### **Sensor Specifications**
 
 The **LSM6DS3TR** provides:
+
 - **Accelerometer**: 3-axis, configurable range (±2/±4/±8/±16 g)
 - **Gyroscope**: 3-axis, configurable range (±125/±250/±500/±1000/±2000 dps)
 - **Data Output**: Raw 16-bit integers (i16) for each axis
@@ -60,21 +62,58 @@ The **LSM6DS3TR** provides:
 
 ### **Tech Stack**
 
-| Component | Version | Purpose |
-| --- | --- | --- |
-| **Embassy** | 0.10.0 | Async runtime with executor, timers, channels |
-| **nrf52840-hal** | 0.19.0 | Synchronous I2C and peripheral access |
-| **lsm6ds3tr** | 0.2.2 | LSM6DS3TR IMU driver |
-| **defmt + defmt-rtt** | 1.1.0 / 1.2.0 | Structured logging over RTT |
-| **embassy-sync** | 0.8.0 | Inter-task channel communication |
-| **linked_list_allocator** | 0.10 | Heap allocator (4 KB) |
-| **panic-probe** | 1.0.0 | Panic handler |
+| Component                 | Version       | Purpose                                       |
+| ------------------------- | ------------- | --------------------------------------------- |
+| **Embassy**               | 0.10.0        | Async runtime with executor, timers, channels |
+| **nrf52840-hal**          | 0.19.0        | Synchronous I2C and peripheral access         |
+| **lsm6ds3tr**             | 0.2.2         | LSM6DS3TR IMU driver                          |
+| **defmt + defmt-rtt**     | 1.1.0 / 1.2.0 | Structured logging over RTT                   |
+| **embassy-sync**          | 0.8.0         | Inter-task channel communication              |
+| **linked_list_allocator** | 0.10          | Heap allocator (4 KB)                         |
+| **panic-probe**           | 1.0.0         | Panic handler                                 |
+
+### **Code Architecture**
+
+The firmware is organized into three main components for testability and maintainability:
+
+| Component                     | Purpose                                                          | Build Target                  |
+| ----------------------------- | ---------------------------------------------------------------- | ----------------------------- |
+| **src/lib.rs**                | Pure logic: motion detection, sensor validation, data structures | Host (std) — Desktop testable |
+| **src/main.rs**               | Embedded code: I2C, IMU, NFC/BLE stubs, async main loop          | nRF52840 (no_std)             |
+| **tests/integration_test.rs** | 18 desktop unit tests for logic (motion, validation, config)     | Host (std) — `cargo test`     |
+
+**Key design decisions:**
+
+- **Separation of concerns**: Logic in `lib.rs` is testable without hardware; embedded-specific code stays in `main.rs`
+- **Feature gates**: Optional dependencies for embedded features allow lib-only testing on desktop
+- **Placeholder stubs**: All unimplemented features (NFC, BLE, LED) have sensible defaults, ready for implementation
+
+### **Build & Test Commands**
+
+```bash
+# Embedded build (nRF52840, ~250 KB binary)
+cargo build --features embedded
+
+# Embedded release build (optimized for size)
+cargo build --release --features embedded
+
+# Desktop unit tests (18 tests, all passing)
+cargo test --test integration_test
+
+# Format & lint
+cargo fmt
+cargo clippy
+
+# Check (fast, no-op build)
+cargo check --features embedded
+```
 
 ### **Build Profile**
+
 - **Optimization**: `-O s` (size optimization)
 - **LTO**: Enabled
 - **Codegen Units**: 1
-- **Target**: `thumbv7em-none-eabihf`
+- **Target**: `thumbv7em-none-eabihf` (ARM Cortex-M4)
 
 ### **Boot Sequence**
 
@@ -117,6 +156,7 @@ The **LSM6DS3TR** provides:
 The device employs a **security-first design** with NFC as the pairing gate:
 
 **Pairing Flow:**
+
 ```
 1. Device boots into NFC Pairing Mode (15 seconds)
    ├─ Bluetooth is HIDDEN (no advertisements)
@@ -139,6 +179,7 @@ The device employs a **security-first design** with NFC as the pairing gate:
 ```
 
 **Implementation (TODO):**
+
 ```rust
 // After NFC detection
 let bonded_device_mac = nfc_read_mac_from_tag();
@@ -194,28 +235,89 @@ struct SensorData {
 ### **Sensor Sampling**
 
 - **Frequency**: 20 Hz (50 ms interval)
-- **Method**: Synchronous I2C reads (blocking)
+- **Method**: Synchronous I2C reads with error handling
 - **Fallback**: Skips failed reads, logs warnings
 - **Communication**: Non-blocking `try_send()` to BLE channel
+- **Validation**: Range-check sensor data before processing
 
 ```rust
-// Main sensor loop
-loop {
-    match imu.read_accel_raw() {
-        Ok(accel) => {
-            match imu.read_gyro_raw() {
-                Ok(gyro) => {
-                    let data = SensorData { accel_x: accel.x, /* ... */ };
-                    let _ = SENSOR_CHANNEL.try_send(data);  // Non-blocking
-                }
-                Err(_) => warn!("Failed to read gyroscope"),
+// Refactored main sensor loop (src/main.rs)
+async fn main_sensor_loop(imu: &mut LSM6DS3TR<I2cInterface<Twim>>) {
+    loop {
+        if let Some(data) = read_sensor_data(imu) {
+            // Validate sensor data (lib function)
+            if !validate_sensor_data(&data) {
+                warn!("⚠️  Sensor data out of valid range");
+                continue;
             }
+
+            // Check for upward thrust (lib function)
+            if detect_upward_thrust(data.accel_z) {
+                animate_led_thrust(200);  // Will become real LED animation
+            }
+
+            // Send to BLE channel
+            let _ = SENSOR_CHANNEL.try_send(data);
+            info!("📊 A:({},{},{}) G:({},{},{})", ...);
         }
-        Err(_) => warn!("Failed to read accelerometer"),
+        Timer::after_millis(50).await;
     }
-    Timer::after_millis(50).await;  // 20 Hz
 }
 ```
+
+### **Refactored Core Functions**
+
+The main firmware has been refactored into modular, testable functions:
+
+| Function                 | Purpose                                             | Status                  |
+| ------------------------ | --------------------------------------------------- | ----------------------- |
+| `init_i2c()`             | Configure TWIM0 I2C pins & frequency                | ✅ Implemented          |
+| `init_imu()`             | Initialize LSM6DS3TR sensor                         | ✅ Implemented          |
+| `read_sensor_data()`     | Single IMU read (accel + gyro) with error handling  | ✅ Implemented          |
+| `nfc_pairing_mode()`     | Wait for NFC field or timeout (15 sec)              | ✅ Implemented          |
+| `main_sensor_loop()`     | Infinite loop: read IMU, detect thrust, send to BLE | ✅ Implemented          |
+| `detect_upward_thrust()` | Motion threshold detection (Z-axis acceleration)    | ✅ Implemented + Tested |
+| `classify_motion()`      | Classify motion type (idle/moderate/intense/thrust) | ✅ Implemented + Tested |
+| `validate_sensor_data()` | Range-check IMU readings                            | ✅ Implemented + Tested |
+
+### **Placeholder Functions (Ready for Implementation)**
+
+These stubs are ready to be filled in with real hardware drivers:
+
+| Function                        | Purpose                                  | Next Step                     |
+| ------------------------------- | ---------------------------------------- | ----------------------------- |
+| `animate_led_thrust()`          | WS2812B LED animation (stub)             | Implement PWM via embassy-nrf |
+| `nfc_detect_field()`            | NFC field detection (stub returns false) | Use nRF52840 NFCT peripheral  |
+| `nfc_read_bonded_device_mac()`  | Read MAC from flash (stub returns None)  | Implement flash storage API   |
+| `ble_advertise_bonded_device()` | BLE radio advertising (stub returns Ok)  | Use embassy-nrf radio module  |
+
+### **Unit Tests (Desktop)**
+
+18 desktop tests verify core logic without hardware:
+
+**SensorData Structure (5 tests)**
+
+- Size: exactly 12 bytes for efficient BLE transmission
+- Alignment: proper i16 field alignment
+- Creation, cloning, equality
+
+**Motion Detection (7 tests)**
+
+- Thrust threshold boundaries (positive, negative, exact boundary)
+- Motion classification (idle < 900², moderate 900–10000², intense ≥ 10000²)
+- Classification with upward thrust override
+
+**Sensor Validation (5 tests)**
+
+- Valid ranges (accel < 10000, gyro < 20000)
+- Out-of-range edge cases
+- Zero values, maximum valid values
+
+**Configuration (1 test)**
+
+- Verify sensible defaults (THRUST_THRESHOLD=50, NFC_TIMEOUT=15s, SAMPLING=50ms)
+
+Run tests: `cargo test --test integration_test`
 
 ### **LED Animation: Motion-Triggered Flash**
 
@@ -233,7 +335,7 @@ fn animate_thrust_effect(led_strip: &mut LedStrip, duration_ms: u32) {
     // 2. Calculate animation phase (0..NUM_LEDS)
     // 3. Brightness decreases towards tip (decay curve)
     // 4. Cycle repeats every 200-300ms or until motion stops
-    
+
     for phase in 0..NUM_LEDS {
         for led_idx in 0..NUM_LEDS {
             let brightness = if led_idx <= phase {
@@ -249,23 +351,32 @@ fn animate_thrust_effect(led_strip: &mut LedStrip, duration_ms: u32) {
 ```
 
 **Animation Behavior:**
+
 - **Upward Thrust**: Flash moves from guard → tip (mimics He-Man's power surge)
 - **Downward**: LEDs fade or pulse (reversing motion)
 - **Idle**: LEDs dim or pulse slowly (breathing effect)
 - **Impact**: Bright flash on high acceleration spikes
 
-```bash
-# Build for release (size-optimized)
-cargo build --release
+### **Build & Development**
 
-# Check without building
-cargo check
+```bash
+# Build for embedded (uses --features embedded for nRF52840 support)
+cargo build --features embedded
+
+# Build for release (size-optimized, ~250 KB)
+cargo build --release --features embedded
+
+# Run desktop unit tests (18 tests, verifies motion detection, validation, config)
+cargo test --test integration_test
 
 # Format code
 cargo fmt
 
-# Run in debug mode (requires probe-rs for flashing)
-cargo run
+# Check for warnings & linting issues
+cargo clippy
+
+# Verify compilation without building
+cargo check --features embedded
 ```
 
 ### **Debugging with RTT**
@@ -273,8 +384,12 @@ cargo run
 The firmware uses **defmt + RTT** for real-time logging. Connect a debugger (e.g., J-Link) and use:
 
 ```bash
-cargo run --release
+# Build and flash with debug output
+cargo run --features embedded
+
 # Output appears in terminal via RTT
+# Watch for sensor readings: "📊 A:(x,y,z) G:(x,y,z)"
+# Watch for thrusts: "💡 LED thrust animation..."
 ```
 
 ### **Inter-Task Communication**
@@ -289,7 +404,6 @@ static SENSOR_CHANNEL: Channel<CriticalSectionRawMutex, SensorData, 16> = Channe
 - **Type**: Non-blocking (skips if channel full)
 - **Purpose**: Decouples sensor reads from BLE transmission
 
-
 ---
 
 ## **3. Mobile App: Flutter (Dart) - Planned**
@@ -299,11 +413,13 @@ static SENSOR_CHANNEL: Channel<CriticalSectionRawMutex, SensorData, 16> = Channe
 To complete the Bluetooth implementation, the firmware needs:
 
 1. **nrf-softdevice stack** (S140 softdevice for BLE)
+
    ```toml
    nrf-softdevice = "0.5"
    ```
 
 2. **GATT Service & Characteristic Setup**
+
    ```rust
    // TODO: Define Sword Sensor GATT service
    // Service UUID: Custom UUID for sensor data
@@ -312,6 +428,7 @@ To complete the Bluetooth implementation, the firmware needs:
    ```
 
 3. **BLE Advertisement (Paired Device Only)**
+
    ```rust
    // TODO: Advertise only to bonded device MAC
    // Device name: "He-man Power Sword"
@@ -359,6 +476,7 @@ Currently, the device sends raw 16-bit sensor values. The Flutter app will recei
 ```
 
 **Real-Time Feedback Loop:**
+
 - Phone receives sensor data → 20 packets/second
 - Detects thrust motion (upward acceleration)
 - Phone can visualize motion AND control blade LEDs
@@ -368,11 +486,11 @@ Currently, the device sends raw 16-bit sensor values. The Flutter app will recei
 
 Once data arrives, the app will use:
 
-| Algorithm | Purpose |
-| --- | --- |
-| **Madgwick AHRS** | Combine accel + gyro → 3D orientation (quaternion) |
-| **Complementary Filter** | Blend accel (low-freq) with gyro (high-freq) |
-| **Zero-Velocity Update (ZUPT)** | Correct drift by detecting stationary periods |
+| Algorithm                       | Purpose                                            |
+| ------------------------------- | -------------------------------------------------- |
+| **Madgwick AHRS**               | Combine accel + gyro → 3D orientation (quaternion) |
+| **Complementary Filter**        | Blend accel (low-freq) with gyro (high-freq)       |
+| **Zero-Velocity Update (ZUPT)** | Correct drift by detecting stationary periods      |
 
 ### **Visualization Goals**
 
@@ -386,6 +504,7 @@ Once data arrives, the app will use:
 - **Permissions**: Add `BLUETOOTH`, `BLUETOOTH_ADMIN`, `ACCESS_FINE_LOCATION` (Android) to `AndroidManifest.xml`.
 
 ### **App Workflow**
+
 1. **BLE Connection**: Scan for the ESP32, connect, and subscribe to notifications.
 2. **Data Parsing**: Unpack the binary data from the ESP32 into `accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, timestamp`.
 3. **Sensor Fusion**: Use a **complementary filter** or **Madgwick/Mahony filter** to combine accelerometer and gyroscope data into a 3D orientation (quaternions or Euler angles).
@@ -397,6 +516,7 @@ Once data arrives, the app will use:
 ## **4. Current Project Status**
 
 ### ✅ **Completed**
+
 - Rust + Embassy embedded runtime working on nRF52840
 - I2C communication with LSM6DS3TR IMU (100 kHz, TWIM0)
 - 20 Hz sensor sampling (50 ms intervals)
@@ -408,6 +528,7 @@ Once data arrives, the app will use:
 - Code compiles with zero errors
 
 ### 🔄 **In Progress**
+
 - Real NFC field detection (currently placeholder timeout)
 - Complete BLE stack integration
 - GATT service and characteristic definitions
@@ -415,6 +536,7 @@ Once data arrives, the app will use:
 - LED strip control (WS2812B PWM driver)
 
 ### ⏳ **TODO**
+
 - nrf-softdevice S140 BLE stack integration
 - NFC Type 2 tag read/write (store bonded MAC)
 - BLE advertise-only-to-bonded-device logic
@@ -433,6 +555,7 @@ Once data arrives, the app will use:
 The sword analyzes accelerometer data in real-time to drive LED animations that match the user's swing:
 
 **Thrust Detection Algorithm:**
+
 ```
 Input: 3-axis accelerometer data (20 Hz)
 
@@ -446,17 +569,18 @@ Output: Motion vector indicating thrust direction and intensity
 
 **LED Flash Animation:**
 
-| Motion Type | LED Pattern | Duration |
-| --- | --- | --- |
-| **Upward Thrust** | Flash propagates guard → tip (white/blue) | 200 ms |
-| **Downward Slash** | Reverse wave or pulse fade (red/orange) | 150 ms |
-| **Impact Hit** | Bright white flash then decay | 100 ms |
-| **Idle/Breathing** | Slow pulse or dim glow | Continuous |
-| **Motion Stop** | Fade to off over 1 sec | 1000 ms |
+| Motion Type        | LED Pattern                               | Duration   |
+| ------------------ | ----------------------------------------- | ---------- |
+| **Upward Thrust**  | Flash propagates guard → tip (white/blue) | 200 ms     |
+| **Downward Slash** | Reverse wave or pulse fade (red/orange)   | 150 ms     |
+| **Impact Hit**     | Bright white flash then decay             | 100 ms     |
+| **Idle/Breathing** | Slow pulse or dim glow                    | Continuous |
+| **Motion Stop**    | Fade to off over 1 sec                    | 1000 ms    |
 
 ### **Implementation Strategy**
 
 **Stage 1: Basic LED Control**
+
 ```rust
 // Drive WS2812B via PWM or SPI
 // Simple on/off animation based on accel_z threshold
@@ -464,6 +588,7 @@ Output: Motion vector indicating thrust direction and intensity
 ```
 
 **Stage 2: Directional Animation**
+
 ```rust
 // Map accel_z → animation phase (0..NUM_LEDS)
 // Each LED represents "distance along thrust"
@@ -471,6 +596,7 @@ Output: Motion vector indicating thrust direction and intensity
 ```
 
 **Stage 3: Advanced Effects (TODO)**
+
 ```rust
 // Color shift based on motion intensity
 // Multiple animation layers (thrust + impact)
@@ -528,6 +654,7 @@ cargo run --release
 ---
 
 ## **7. References**
+
 - **Rust Embedded**:
   - [Embassy Framework](https://github.com/embassy-rs/embassy)
   - [nrf52840-hal](https://github.com/nrf-rs/nrf-hal)
@@ -551,16 +678,19 @@ cargo run --release
 ## **Architecture Decision Records (ADRs)**
 
 ### **ADR-1: NFC as Primary Pairing Gate**
+
 - **Decision**: NFC required for Bluetooth pairing (not just connection)
 - **Rationale**: Security + UX (tap-to-pair is intuitive)
 - **Alternative**: QR code / PIN (rejected: less natural for a physical device)
 
 ### **ADR-2: LED Animations Driven by Accelerometer**
+
 - **Decision**: Real-time motion detection → LED flash
 - **Rationale**: Immediate feedback without phone latency (~20-50ms)
 - **Alternative**: Phone-only control (rejected: too much lag)
 
 ### **ADR-3: Bonded Device Whitelist**
+
 - **Decision**: Only paired MAC address can connect post-pairing
 - **Rationale**: Prevents accidental connection from other devices
 - **Alternative**: Require PIN each time (rejected: poor UX)

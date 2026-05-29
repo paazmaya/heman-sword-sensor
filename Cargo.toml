@@ -3,17 +3,43 @@ name = "xiao_nrf52840_sword"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+std = []
+# Embedded feature: enables all embedded-specific dependencies
+embedded = [
+    "embassy-time",
+    "embassy-executor",
+    "embassy-sync",
+    "defmt",
+    "defmt-rtt",
+    "panic-probe",
+    "lsm6ds3tr",
+    "cortex-m-rt",
+    "nrf52840-hal",
+    "linked_list_allocator",
+]
+
+[[bin]]
+name = "xiao_nrf52840_sword"
+required-features = ["embedded"]
+test = false  # Exclude binary from test suite (lib-only tests)
+
 [dependencies]
-embassy-time = "0.5.1"
-embassy-executor = { version = "0.10.0", features = ["defmt", "platform-cortex-m", "executor-thread"] }
-embassy-sync = "0.8.0"
-defmt = "1.1.0"
-defmt-rtt = "1.2.0"
-panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-lsm6ds3tr = "0.2.2"
-cortex-m-rt = "0.7"
-nrf52840-hal = "0.19.0"
-linked_list_allocator = "0.10"
+# Core dependencies (lib-usable, std-compatible)
+# (none at the moment, all are embedded-specific)
+
+# Embedded-only dependencies
+embassy-time = { version = "0.5.1", optional = true }
+embassy-executor = { version = "0.10.0", features = ["defmt", "platform-cortex-m", "executor-thread"], optional = true }
+embassy-sync = { version = "0.8.0", optional = true }
+defmt = { version = "1.1.0", optional = true }
+defmt-rtt = { version = "1.2.0", optional = true }
+panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
+lsm6ds3tr = { version = "0.2.2", optional = true }
+cortex-m-rt = { version = "0.7", optional = true }
+nrf52840-hal = { version = "0.19.0", optional = true }
+linked_list_allocator = { version = "0.10", optional = true }
 
 [profile.release]
 opt-level = "s"
