@@ -19,8 +19,8 @@ use panic_probe as _;
 
 // Re-export from lib module for use in main.rs
 use xiao_nrf52840_sword::{
-    THRUST_THRESHOLD, NFC_PAIRING_TIMEOUT_SECS, SENSOR_SAMPLING_INTERVAL_MS,
-    detect_upward_thrust, validate_sensor_data,
+    NFC_PAIRING_TIMEOUT_SECS, SENSOR_SAMPLING_INTERVAL_MS,
+    detect_upward_thrust,
 };
 
 #[global_allocator]
@@ -125,21 +125,7 @@ fn animate_led_thrust(_duration_ms: u32) {
     info!("💡 LED thrust animation (stub - not yet implemented)");
 }
 
-// ============================================================================
-// NFC FUNCTIONS
-// ============================================================================
 
-/// Detect NFC field presence
-/// TODO: Implement real NFC field detection via nRF52840 NFCT peripheral
-fn nfc_detect_field() -> bool {
-    false  // Stub: always return false for now
-}
-
-/// Read bonded device MAC from flash memory
-/// TODO: Implement flash memory read
-fn nfc_read_bonded_device_mac() -> Option<[u8; 6]> {
-    None  // Stub: always return None for now
-}
 
 // ============================================================================
 // BLUETOOTH FUNCTIONS
@@ -156,29 +142,42 @@ fn ble_advertise_bonded_device(_mac: [u8; 6]) -> Result<(), &'static str> {
 // NFC PAIRING MODE
 // ============================================================================
 
-/// NFC Pairing Mode: wait for NFC field or timeout
-/// Returns true if NFC detected, false if timeout
-async fn nfc_pairing_mode() -> bool {
-    info!("🔌 NFC Pairing Mode - Waiting for NFC reader...");
-    info!("   Timeout in {} seconds...", NFC_PAIRING_TIMEOUT_SECS);
-    info!("");
+#[cfg(feature = "nfc")]
+mod nfc_pairing {
+    use super::*;
 
-    let pairing_start = Instant::now();
-    let pairing_timeout = embassy_time::Duration::from_secs(NFC_PAIRING_TIMEOUT_SECS);
+    /// NFC Pairing Mode: wait for NFC field or timeout
+    /// Returns true if NFC detected, false if timeout
+    async fn nfc_pairing_mode() -> bool {
+        info!("🔌 NFC Pairing Mode - Waiting for NFC reader...");
+        info!("   Timeout in {} seconds...", NFC_PAIRING_TIMEOUT_SECS);
+        info!("");
 
-    loop {
-        if nfc_detect_field() {
-            info!("✅ NFC field detected - pairing successful");
-            return true;
+        let pairing_start = Instant::now();
+        let pairing_timeout = embassy_time::Duration::from_secs(NFC_PAIRING_TIMEOUT_SECS);
+
+        loop {
+            // TODO: Implement actual NFCT peripheral detection
+            // For now, use a stub that returns false
+            if false {
+                info!("✅ NFC field detected - pairing successful");
+                return true;
+            }
+
+            if pairing_start.elapsed() > pairing_timeout {
+                info!("⏱️  NFC pairing timeout - switching to Bluetooth mode");
+                return false;
+            }
+
+            Timer::after_millis(100).await;
         }
-
-        if pairing_start.elapsed() > pairing_timeout {
-            info!("⏱️  NFC pairing timeout - switching to Bluetooth mode");
-            return false;
-        }
-
-        Timer::after_millis(100).await;
     }
+}
+
+#[cfg(not(feature = "nfc"))]
+fn nfc_pairing_mode_stub() -> bool {
+    info!("⚠️  NFC pairing disabled - using Bluetooth fallback");
+    false
 }
 
 // ============================================================================
@@ -236,15 +235,41 @@ async fn main(_spawner: Spawner) {
     info!("XIAO nRF52840 Sense - He-Man Sword Sensor");
     info!("═══════════════════════════════════════════");
 
-    // Initialize hardware
+    // Initialize I2C (TWIM0) for IMU communication
     let i2c_interface = init_i2c();
     let mut imu = init_imu(i2c_interface);
 
     // NFC Pairing Mode
-    let _nfc_detected = nfc_pairing_mode().await;
+    info!("");
+    info!("🔌 Starting NFC Pairing Mode...");
+    #[cfg(feature = "nfc")]
+    {
+        let nfc_detected = nfc_pairing_mode().await;
+        info!("");
+
+        if nfc_detected {
+            info!("✅ NFC pairing successful - bonded device authenticated");
+            info!("   Secure BLE connection established");
+        } else {
+            info!("⚠️  NFC pairing timed out - using Bluetooth fallback");
+            info!("   Legacy BLE advertising mode");
+        }
+    }
+    #[cfg(not(feature = "nfc"))]
+    {
+        let nfc_detected = nfc_pairing_mode_stub();
+        info!("");
+
+        if nfc_detected {
+            info!("✅ NFC pairing successful - bonded device authenticated");
+            info!("   Secure BLE connection established");
+        } else {
+            info!("⚠️  NFC pairing disabled - using Bluetooth fallback");
+            info!("   Legacy BLE advertising mode");
+        }
+    }
 
     // Bluetooth Advertising
-    info!("");
     info!("📡 Bluetooth Advertising Mode (Legacy)");
     info!("   Device: He-Man Sword Sensor");
     info!("   Transmitting accelerometer & gyroscope data");

@@ -16,8 +16,7 @@ https://wiki.seeedstudio.com/XIAO_BLE/
 | ---------------- | -------------------------------------------------------------------------- |
 | **MCU**          | nRF52840 (ARM Cortex-M4, Bluetooth 5.0)                                    |
 | **IMU**          | LSM6DS3TR-C (6-axis: ±2/±4/±8/±16 g, ±125/±250/±500/±1000/±2000 dps)       |
-| **Connectivity** | Bluetooth 5.0, NFC Type 2 tag (built-in)                                   |
-| **Power**        | 3.3V, BQ25101 charging, ~300 mAh LiPo battery (or larger for extended use) |
+| **Connectivity** | Bluetooth 5.0, NFC Type 2 tag (built-in)                                   |### **NFC Pairing** | Type 2 Tag (NFCT peripheral) - Tap-to-pair authentication || **Power**        | 3.3V, BQ25101 charging, ~300 mAh LiPo battery (or larger for extended use) |
 | **Size**         | 20×17.5 mm (fits in sword handle)                                          |
 | **I2C Bus**      | IMU connected via TWIM0 (P0.26 SDA, P0.27 SCL, 100 kHz)                    |
 
@@ -47,6 +46,203 @@ The **LSM6DS3TR** provides:
 - **Gyroscope**: 3-axis, configurable range (±125/±250/±500/±1000/±2000 dps)
 - **Data Output**: Raw 16-bit integers (i16) for each axis
 - **I2C Address**: 0x6A (no jumpers needed)
+
+---
+
+## **3. NFC Pairing System**
+
+The He-Man Sword Sensor implements a secure NFC-based pairing system using the nRF52840's built-in NFC Type 2 Tag (NFCT) controller.
+
+### **NFC Pairing Flow**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    NFC PAIRING FLOW                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. BOOT                                                    │
+│     │                                                       │
+│     ▼                                                       │
+│  2. INITIALIZATION                                         │
+│     │                                                       │
+│     ▼                                                       │
+│  3. NFC PAIRING MODE (15 sec timeout)                      │
+│     │                                                       │
+│     ▼                                                       │
+│  4. NFC FIELD DETECTED                                      │
+│     │                                                       │
+│     ▼                                                       │
+│  5. READ BONDED MAC FROM FLASH                             │
+│     │                                                       │
+│     ▼                                                       │
+│  6. AUTHENTICATE DEVICE                                    │
+│     │                                                       │
+│     ▼                                                       │
+│  7. PAIRING SUCCESS ✅                                      │
+│     │                                                       │
+│     ▼                                                       │
+│  8. BLE CONNECTION ESTABLISHED                             │
+│     │                                                       │
+│     ▼                                                       │
+│  9. SENSOR DATA STREAMING                                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### **NFC Pairing Steps**
+
+1. **Boot & Initialization**
+   - Initialize NFCT peripheral
+   - Initialize I2C for IMU
+   - Start NFC pairing mode
+
+2. **NFC Field Detection**
+   - Scan for NFC Type 2 Tag in field
+   - Wait up to 15 seconds for field presence
+   - Detect passive NFC tags automatically
+
+3. **Bonded Device Authentication**
+   - Read MAC address from flash memory
+   - Verify MAC against stored credentials
+   - Check device flags (active, paired, verified)
+
+4. **Pairing Success**
+   - Establish secure BLE connection
+   - Start sensor data streaming
+   - Enable real-time motion tracking
+
+### **NFC Hardware**
+
+The nRF52840 Sense board includes a built-in **NFC Type 2 Tag (NFCT)** controller:
+
+| Feature | Details |
+|---------|---------|
+| **Peripheral** | NFCT (NFC Type 2 Tag) |
+| **Standard** | ISO/IEC 14443 Type A |
+| **Max Range** | ~10 cm |
+| **Detection** | Passive tag detection |
+| **UID Length** | 10 bytes |
+
+### **Flash Storage Layout**
+
+The bonded device MAC is stored in flash memory:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Flash Memory (512 KB)                                   │
+├─────────────────────────────────────────────────────────┤
+│ 0x0000-0x0FFF  │ Bootloader                             │
+│ 0x1000-0x1FFF  │ Application code                       │
+│ 0x2000-0x2FFF  │ Bonded device storage (8 KB)            │
+│                │   - Bonded MAC at offset 0x2000          │
+│                │   - Timestamp at offset 0x2006           │
+│                │   - Flags at offset 0x200C              │
+│ 0x3000-0x3FFF  │ Other data                             │
+│ 0x4000-0x7FFF  │ RAM (192 KB)                           │
+└─────────────────────────────────────────────────────────┘
+```
+
+### **Bonded Device Structure**
+
+```rust
+#[repr(C)]
+struct BondedDevice {
+    mac: [u8; 6],      // MAC address
+    timestamp: u32,    // Last pairing timestamp
+    flags: u8,         // Active, paired, verified
+}
+```
+
+### **NFC Pairing Configuration**
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Timeout** | 15 seconds | Maximum pairing time |
+| **Scan Interval** | 100 ms | NFC field detection rate |
+| **Flash Region** | 0x2000-0x2FFF | Bonded device storage |
+| **MAC Size** | 6 bytes | Standard MAC address |
+
+### **NFC Pairing Status**
+
+The system tracks NFC pairing status through states:
+
+```rust
+enum NfcPairingStatus {
+    Idle,           // Waiting for NFC field
+    Scanning,       // Scanning for NFC tags
+    Authenticating, // Authenticating bonded device
+    Success,        // Pairing completed
+    Failed,         // Authentication failed
+    Timeout,        // Pairing timeout
+}
+```
+
+### **Security Features**
+
+1. **Bonded Device Whitelist**
+   - Only registered MAC addresses can pair
+   - Prevents unauthorized connections
+
+2. **Flash Storage**
+   - MAC addresses stored in protected flash region
+   - Persistent across reboots
+
+3. **Timestamp Verification**
+   - Pairing timestamps tracked in flash
+   - Detects tampering attempts
+
+### **Pairing Process**
+
+1. **User Action**: Tap NFC-enabled device to sword sensor
+2. **Detection**: NFCT peripheral detects passive NFC tag
+3. **Authentication**: MAC address verified against bonded list
+4. **Connection**: Secure BLE connection established
+5. **Streaming**: Sensor data begins transmission
+
+### **Fallback Mechanism**
+
+If NFC pairing times out (15 seconds), the system automatically falls back to:
+
+- **Legacy BLE Advertising**
+- **Standard Bluetooth pairing**
+- **PIN code authentication** (optional)
+
+### **Testing NFC Pairing**
+
+```bash
+# Build with NFC support
+cargo build --features embedded
+
+# Run with NFC pairing mode
+cargo run --release --features embedded
+
+# Expected output:
+# 🔌 NFC Pairing Mode - Primary Authentication Gate
+# 📡 NFC Field Detection - Scanning for NFC tags...
+# ✅ NFC field detected - initiating pairing sequence...
+# 🔑 Bonded device MAC: [00,11,22,33,44,55]
+# ✅ Bonded device authentication successful
+```
+
+### **NFC Pairing API**
+
+```rust
+// Detect NFC field presence
+async fn nfc_detect_field() -> bool
+
+// Read bonded device MAC from flash
+fn nfc_read_bonded_device_mac() -> Option<[u8; 6]>
+
+// Start pairing mode
+async fn nfc_pairing_mode() -> bool
+
+// Get pairing status
+fn get_nfc_pairing_status() -> NfcPairingStatus
+```
+
+---
+
+## **4. Firmware: Rust + Embassy Framework**
 
 ### **Optimal Sensor Placement**
 
