@@ -19,8 +19,7 @@ use panic_probe as _;
 
 // Re-export from lib module for use in main.rs
 use xiao_nrf52840_sword::{
-    NFC_PAIRING_TIMEOUT_SECS, SENSOR_SAMPLING_INTERVAL_MS,
-    detect_upward_thrust,
+    detect_upward_thrust, NFC_PAIRING_TIMEOUT_SECS, SENSOR_SAMPLING_INTERVAL_MS,
 };
 
 #[global_allocator]
@@ -74,7 +73,9 @@ fn init_i2c() -> I2cInterface<Twim<nrf52840_hal::pac::TWIM0>> {
 }
 
 /// Initialize the LSM6DS3TR IMU sensor
-fn init_imu(i2c_interface: I2cInterface<Twim<nrf52840_hal::pac::TWIM0>>) -> LSM6DS3TR<I2cInterface<Twim<nrf52840_hal::pac::TWIM0>>> {
+fn init_imu(
+    i2c_interface: I2cInterface<Twim<nrf52840_hal::pac::TWIM0>>,
+) -> LSM6DS3TR<I2cInterface<Twim<nrf52840_hal::pac::TWIM0>>> {
     let imu = LSM6DS3TR::new(i2c_interface);
     info!("IMU (LSM6DS3TR) initialized at 0x6A");
     info!("");
@@ -87,27 +88,27 @@ fn init_imu(i2c_interface: I2cInterface<Twim<nrf52840_hal::pac::TWIM0>>) -> LSM6
 
 /// Read sensor data (accel + gyro) from IMU
 /// Returns None if either read fails
-fn read_sensor_data(imu: &mut LSM6DS3TR<I2cInterface<Twim<nrf52840_hal::pac::TWIM0>>>) -> Option<SensorData> {
+fn read_sensor_data(
+    imu: &mut LSM6DS3TR<I2cInterface<Twim<nrf52840_hal::pac::TWIM0>>>,
+) -> Option<SensorData> {
     match imu.read_accel_raw() {
-        Ok(accel) => {
-            match imu.read_gyro_raw() {
-                Ok(gyro) => {
-                    let data = SensorData {
-                        accel_x: accel.x,
-                        accel_y: accel.y,
-                        accel_z: accel.z,
-                        gyro_x: gyro.x,
-                        gyro_y: gyro.y,
-                        gyro_z: gyro.z,
-                    };
-                    Some(data)
-                }
-                Err(_) => {
-                    warn!("Failed to read gyroscope");
-                    None
-                }
+        Ok(accel) => match imu.read_gyro_raw() {
+            Ok(gyro) => {
+                let data = SensorData {
+                    accel_x: accel.x,
+                    accel_y: accel.y,
+                    accel_z: accel.z,
+                    gyro_x: gyro.x,
+                    gyro_y: gyro.y,
+                    gyro_z: gyro.z,
+                };
+                Some(data)
             }
-        }
+            Err(_) => {
+                warn!("Failed to read gyroscope");
+                None
+            }
+        },
         Err(_) => {
             warn!("Failed to read accelerometer");
             None
@@ -124,8 +125,6 @@ fn read_sensor_data(imu: &mut LSM6DS3TR<I2cInterface<Twim<nrf52840_hal::pac::TWI
 fn animate_led_thrust(_duration_ms: u32) {
     info!("💡 LED thrust animation (stub - not yet implemented)");
 }
-
-
 
 // ============================================================================
 // BLUETOOTH FUNCTIONS
@@ -193,9 +192,8 @@ async fn main_sensor_loop(imu: &mut LSM6DS3TR<I2cInterface<Twim<nrf52840_hal::pa
             let accel_valid = data.accel_x.abs() < 10000
                 && data.accel_y.abs() < 10000
                 && data.accel_z.abs() < 10000;
-            let gyro_valid = data.gyro_x.abs() < 20000
-                && data.gyro_y.abs() < 20000
-                && data.gyro_z.abs() < 20000;
+            let gyro_valid =
+                data.gyro_x.abs() < 20000 && data.gyro_y.abs() < 20000 && data.gyro_z.abs() < 20000;
 
             if !accel_valid || !gyro_valid {
                 warn!("⚠️  Sensor data out of valid range");
@@ -214,8 +212,7 @@ async fn main_sensor_loop(imu: &mut LSM6DS3TR<I2cInterface<Twim<nrf52840_hal::pa
             // Log the data
             info!(
                 "📊 A:({},{},{}) G:({},{},{})",
-                data.accel_x, data.accel_y, data.accel_z,
-                data.gyro_x, data.gyro_y, data.gyro_z
+                data.accel_x, data.accel_y, data.accel_z, data.gyro_x, data.gyro_y, data.gyro_z
             );
         }
 
@@ -273,10 +270,12 @@ async fn main(_spawner: Spawner) {
     info!("📡 Bluetooth Advertising Mode (Legacy)");
     info!("   Device: He-Man Sword Sensor");
     info!("   Transmitting accelerometer & gyroscope data");
-    info!("   Sampling rate: 20 Hz ({}ms interval)", SENSOR_SAMPLING_INTERVAL_MS);
+    info!(
+        "   Sampling rate: 20 Hz ({}ms interval)",
+        SENSOR_SAMPLING_INTERVAL_MS
+    );
     info!("");
 
     // Main sensor loop
     main_sensor_loop(&mut imu).await;
 }
-

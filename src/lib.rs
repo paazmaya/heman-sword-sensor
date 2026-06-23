@@ -1,5 +1,5 @@
 //! Pure logic module for He-Man Sword Sensor
-//! 
+//!
 //! This module contains testable functions that don't depend on embedded hardware.
 //! All embedded-specific code remains in main.rs.
 
@@ -13,9 +13,9 @@ use defmt::{info, warn};
 // CONFIGURATION CONSTANTS
 // ============================================================================
 
-pub const THRUST_THRESHOLD: i16 = 50;  // Threshold for upward thrust detection (~0.5g)
+pub const THRUST_THRESHOLD: i16 = 50; // Threshold for upward thrust detection (~0.5g)
 pub const NFC_PAIRING_TIMEOUT_SECS: u64 = 15;
-pub const SENSOR_SAMPLING_INTERVAL_MS: u64 = 50;  // 20 Hz
+pub const SENSOR_SAMPLING_INTERVAL_MS: u64 = 50; // 20 Hz
 
 // ============================================================================
 // SENSOR DATA STRUCTURE
@@ -71,9 +71,7 @@ pub fn detect_upward_thrust(accel_z: i16) -> bool {
 
 /// Classify motion based on acceleration magnitude
 pub fn classify_motion(accel_x: i16, accel_y: i16, accel_z: i16) -> MotionType {
-    let magnitude_sq = (accel_x as i32).pow(2)
-        + (accel_y as i32).pow(2)
-        + (accel_z as i32).pow(2);
+    let magnitude_sq = (accel_x as i32).pow(2) + (accel_y as i32).pow(2) + (accel_z as i32).pow(2);
 
     if detect_upward_thrust(accel_z) {
         MotionType::UpwardThrust
@@ -102,14 +100,12 @@ pub enum MotionType {
 /// Returns true if data is within expected ranges
 pub fn validate_sensor_data(data: &SensorData) -> bool {
     // Accelerometer: typically ±16g, ±2g = ±20480 in raw values, so ±5000 is safe
-    let accel_valid = data.accel_x.abs() < 10000
-        && data.accel_y.abs() < 10000
-        && data.accel_z.abs() < 10000;
+    let accel_valid =
+        data.accel_x.abs() < 10000 && data.accel_y.abs() < 10000 && data.accel_z.abs() < 10000;
 
     // Gyroscope: typically ±2000 dps, raw value limit is ±32767
-    let gyro_valid = data.gyro_x.abs() < 20000
-        && data.gyro_y.abs() < 20000
-        && data.gyro_z.abs() < 20000;
+    let gyro_valid =
+        data.gyro_x.abs() < 20000 && data.gyro_y.abs() < 20000 && data.gyro_z.abs() < 20000;
 
     accel_valid && gyro_valid
 }
@@ -200,7 +196,7 @@ impl BondedDevice {
 }
 
 /// NFC Field Detection
-/// 
+///
 /// This module provides NFC field detection functionality for the nRF52840.
 /// In production, this would use the actual NFCT (NFC Type 2 Tag) peripheral.
 #[cfg(feature = "embedded")]
@@ -223,7 +219,7 @@ pub mod nfc {
     }
 
     /// Detect NFC field presence
-    /// 
+    ///
     /// In a real implementation, this would:
     /// 1. Initialize the NFCT peripheral
     /// 2. Configure it to listen for passive tags
@@ -231,7 +227,7 @@ pub mod nfc {
     /// 4. Return true if a valid tag is detected
     pub async fn detect_field() -> bool {
         info!("📡 NFC Field Detection - Scanning for NFC tags...");
-        
+
         // Simulate NFC field detection
         // In production, this would use the actual NFCT peripheral
         Timer::after_millis(100).await;
@@ -239,14 +235,14 @@ pub mod nfc {
     }
 
     /// Read NFC field UID
-    /// 
+    ///
     /// Returns the UID of the detected NFC tag
     pub async fn read_nfc_uid() -> Option<[u8; 10]> {
         info!("📡 Reading NFC UID...");
-        
+
         // Simulated NFC UID (10 bytes for Type 2 Tag)
         let nfc_uid = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
-        
+
         info!("✅ NFC UID: {:?}", nfc_uid);
         Some(nfc_uid)
     }
@@ -263,7 +259,7 @@ pub mod nfc {
 }
 
 /// NFC Pairing Functions
-/// 
+///
 /// These functions handle the complete NFC pairing flow:
 /// 1. Detect NFC field
 /// 2. Read bonded device MAC from flash
@@ -275,12 +271,12 @@ pub mod pairing {
     use embassy_time::{Duration, Instant, Timer};
 
     /// NFC Pairing Mode: wait for NFC field or timeout
-    /// 
+    ///
     /// This function implements the primary pairing gate:
     /// 1. Wait for NFC field presence (up to 15 seconds)
     /// 2. If NFC detected, read bonded MAC and authenticate
     /// 3. If timeout, fall back to Bluetooth mode
-    /// 
+    ///
     /// Returns true if NFC pairing successful, false if timeout
     pub async fn pairing_mode() -> bool {
         info!("═══════════════════════════════════════════");
@@ -296,17 +292,17 @@ pub mod pairing {
             // Check for NFC field presence
             if nfc::detect_field().await {
                 info!("✅ NFC field detected - initiating pairing sequence...");
-                
+
                 // Read bonded device MAC from flash
                 if let Some(bonded_mac) = read_bonded_device_mac() {
                     info!("🔑 Bonded device MAC: {:?}", bonded_mac);
-                    
+
                     // In a real implementation, we would:
                     // 1. Send the MAC to the paired mobile app
                     // 2. Verify the MAC against stored credentials
                     // 3. Establish secure BLE connection
                     // 4. Store the pairing timestamp and flags
-                    
+
                     info!("✅ Bonded device authentication successful");
                     return true;
                 } else {
@@ -329,40 +325,40 @@ pub mod pairing {
     }
 
     /// Read bonded device MAC from flash memory
-    /// 
+    ///
     /// The nRF52840 has 512 KB of flash memory. We'll store the bonded
     /// device MAC address in a dedicated region of flash.
     pub fn read_bonded_device_mac() -> Option<[u8; 6]> {
         info!("🔑 Reading bonded device MAC from flash...");
-        
+
         // In a real implementation, we would:
         // 1. Use the nRF52840's flash controller to read from flash memory
         // 2. Read the MAC address from the bonded device storage region
         // 3. Validate the data (check timestamp, flags, etc.)
         // 4. Return the MAC address if valid
-        
+
         // For now, we'll simulate reading a bonded MAC from flash
         // In production, this would use the actual flash controller
-        
+
         // Simulated bonded MAC (would be read from flash in real hardware)
         let bonded_mac = [0x00, 11, 22, 33, 44, 55];
-        
+
         info!("✅ Bonded MAC read: {:?}", bonded_mac);
         Some(bonded_mac)
     }
 
     /// Authenticate bonded device
-    /// 
+    ///
     /// Verifies the MAC address against stored credentials
     pub fn authenticate_bonded_device(_mac: &[u8; 6]) -> bool {
         info!("🔐 Authenticating bonded device...");
-        
+
         // In a real implementation, we would:
         // 1. Compare the provided MAC with the stored MAC
         // 2. Verify the timestamp is recent
         // 3. Check the device flags
         // 4. Return true if authentication succeeds
-        
+
         // For now, we'll simulate successful authentication
         info!("✅ Authentication successful");
         true
@@ -379,68 +375,68 @@ pub mod pairing {
     }
 
     /// Write bonded device MAC to flash memory
-    /// 
+    ///
     /// Stores the MAC address in the bonded device storage region
     /// Flash offset: 0x2000 (8 KB region)
     pub fn write_bonded_device_to_flash(_mac: &[u8; 6]) -> bool {
         info!("💾 Writing bonded device MAC to flash...");
-        
+
         // In a real implementation, we would:
         // 1. Use the nRF52840's flash controller to write to flash memory
         // 2. Write the MAC address at offset 0x2000
         // 3. Write timestamp at offset 0x2006
         // 4. Write flags at offset 0x200C
         // 5. Verify the write was successful
-        
+
         // For now, we'll simulate successful flash write
         info!("✅ Bonded device MAC written to flash");
         true
     }
 
     /// Register new bonded device
-    /// 
+    ///
     /// Adds a new MAC address to the bonded device list
     pub fn register_bonded_device(mac: &[u8; 6]) -> bool {
         info!("📝 Registering new bonded device...");
-        
+
         // In a real implementation, we would:
         // 1. Read existing bonded devices from flash
         // 2. Check if MAC already exists
         // 3. If new, write to flash storage
         // 4. Return success
-        
+
         // For now, we'll simulate successful registration
         info!("✅ New bonded device registered: {:?}", mac);
         true
     }
 
     /// Unregister bonded device
-    /// 
+    ///
     /// Removes a MAC address from the bonded device list
     pub fn unregister_bonded_device(mac: &[u8; 6]) -> bool {
         info!("🗑️  Unregistering bonded device...");
-        
+
         // In a real implementation, we would:
         // 1. Read existing bonded devices from flash
         // 2. Remove the specified MAC
         // 3. Write updated list to flash
         // 4. Return success
-        
+
         // For now, we'll simulate successful unregistration
         info!("✅ Bonded device unregistered: {:?}", mac);
         true
     }
 
     /// Get all bonded devices
-    /// 
+    ///
     /// Returns a list of all registered bonded devices
     pub fn get_bonded_devices() -> [BondedDevice; 2] {
         info!("📋 Reading bonded devices from flash...");
-        
+
         // In a real implementation, we would:
         // 1. Read all bonded devices from flash
         // 2. Return the list
-        
+
         // For now, we'll return a simulated list
         [
             BondedDevice::new([0x00, 11, 22, 33, 44, 55]),
@@ -454,5 +450,3 @@ pub mod pairing {
         devices.iter().any(|d| d.mac == *mac)
     }
 }
-
-
