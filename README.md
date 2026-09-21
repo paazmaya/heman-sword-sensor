@@ -4,8 +4,6 @@
 
 A high-tech sword sensor with real-time motion tracking, NFC pairing security, and dynamic LED animations synchronized to your strikes. Track your swings with Bluetooth and watch the power flow through the blade.
 
----
-
 ## Project Status
 
 ### Completed
@@ -36,8 +34,6 @@ A high-tech sword sensor with real-time motion tracking, NFC pairing security, a
 - LED animation engine
 - Mobile app for pairing, visualization, and real-time LED control
 - Sensor fusion algorithms such as Madgwick AHRS
-
----
 
 ## 1. Hardware: XIAO nRF52840 Sense + LSM6DS3TR IMU
 
@@ -99,8 +95,6 @@ The LSM6DS3TR provides:
 - Far enough from the tip to avoid excessive linear acceleration noise
 - Avoid the sword tip or center of mass because they introduce centrifugal force noise
 
----
-
 ## 2. Firmware: Rust + Embassy Framework
 
 ### Tech Stack
@@ -110,10 +104,10 @@ The LSM6DS3TR provides:
 | **Embassy**               | 0.10.0        | Async runtime with executor, timers, and channels |
 | **nrf52840-hal**          | 0.19.0        | Peripheral access and synchronous I2C             |
 | **lsm6ds3tr**             | 0.2.2         | LSM6DS3TR IMU driver                              |
-| **defmt + defmt-rtt**     | 1.1.0 / 1.2.0 | Structured logging over RTT                       |
+| **defmt + defmt-rtt**     | 0.3 / 0.4     | Structured logging over RTT                       |
 | **embassy-sync**          | 0.8.0         | Inter-task channel communication                  |
-| **linked_list_allocator** | 0.10          | 4 KB heap allocator                               |
-| **panic-probe**           | 1.0.0         | Panic handler                                     |
+| **linked_list_allocator** | 0.10.6        | 4 KB heap allocator                               |
+| **panic-probe**           | 0.2           | Panic handler                                     |
 
 ### Code Architecture
 
@@ -125,10 +119,11 @@ The LSM6DS3TR provides:
 
 Key design decisions:
 
-- Logic in `src/lib.rs` is testable without hardware
-- Embedded-specific code stays in `src/main.rs`
+- Logic in `src/lib.rs` is testable without hardware using standard library traits (`Debug`, `PartialEq`, `Eq`)
+- Embedded-specific code stays in `src/main.rs` with embedded-specific traits (`defmt::Format`)
 - Optional dependencies and feature gates allow desktop testing
 - Unimplemented features such as NFC, BLE, and LED control have sensible stubs
+- Integration tests automatically run on host target without manual target specification
 
 ### Boot Sequence
 
@@ -283,16 +278,16 @@ Bonded device management planned for flash storage:
 
 ```bash
 # Build with embedded support
-cargo build --features embedded
+cargo build --features embedded --target thumbv7em-none-eabihf
 
 # Build release image for flashing
-cargo build --release --features embedded
+cargo build --release --features embedded --target thumbv7em-none-eabihf
 
-# Run desktop tests
+# Run desktop tests (runs on host target automatically)
 cargo test --test integration_test
 
-# Run with NFC pairing mode enabled
-cargo run --release --features embedded
+# Run with NFC pairing mode enabled (requires embedded target)
+cargo run --release --features embedded --target thumbv7em-none-eabihf
 ```
 
 NFC-specific tests should cover:
@@ -327,14 +322,29 @@ Data is packed into a 12-byte `SensorData` struct for efficient BLE transmission
 
 ```rust
 #[repr(C)]
-#[derive(Clone, Copy, defmt::Format)]
-struct SensorData {
-    accel_x: i16,
-    accel_y: i16,
-    accel_z: i16,
-    gyro_x: i16,
-    gyro_y: i16,
-    gyro_z: i16,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SensorData {
+    pub accel_x: i16,
+    pub accel_y: i16,
+    pub accel_z: i16,
+    pub gyro_x: i16,
+    pub gyro_y: i16,
+    pub gyro_z: i16,
+}
+
+impl SensorData {
+    pub fn new(
+        accel_x: i16,
+        accel_y: i16,
+        accel_z: i16,
+        gyro_x: i16,
+        gyro_y: i16,
+        gyro_z: i16,
+    ) -> Self { /* ... */ }
+
+    pub fn size() -> usize {
+        core::mem::size_of::<SensorData>()
+    }
 }
 ```
 
@@ -394,15 +404,19 @@ Desktop tests verify core logic without hardware:
 
 - `SensorData` size, alignment, creation, cloning, and equality
 - Thrust threshold boundaries
-- Motion classification
+- Motion classification (Idle, Moderate, Intense, UpwardThrust)
 - Sensor validation edge cases
 - Configuration constants: `THRUST_THRESHOLD`, `NFC_PAIRING_TIMEOUT_SECS`, and `SENSOR_SAMPLING_INTERVAL_MS`
+
+The integration test runs on the host target (desktop) and tests the pure logic in `src/lib.rs` without requiring embedded hardware.
 
 Run tests:
 
 ```bash
 cargo test --test integration_test
 ```
+
+This will run 18 tests covering all the core functionality. The test automatically runs on the host target, so no target specification is needed.
 
 ### LED Animation: Motion-Triggered Flash
 
@@ -446,8 +460,6 @@ Performance constraints:
 - Sensor data rate: 20 Hz, 50 ms per sample
 - Latency target: under 100 ms from motion to LED update
 - LED strip power budget: approximately 100-500 mA, external supply recommended
-
----
 
 ## 3. Mobile App: Flutter (Dart) - Planned
 
@@ -495,8 +507,6 @@ Android permissions:
 - `BLUETOOTH_ADMIN`
 - `ACCESS_FINE_LOCATION`
 
----
-
 ## 4. Build and Development
 
 ### Prerequisites
@@ -505,23 +515,25 @@ Android permissions:
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Add ARM target
+# Add ARM target (required for embedded builds)
 rustup target add thumbv7em-none-eabihf
 
 # Install Probe-rs for flashing
 cargo install probe-rs-tools
 ```
 
+**Important**: All embedded build commands must specify the target architecture with `--target thumbv7em-none-eabihf`. Desktop tests run on the host target automatically.
+
 ### Build and Test Commands
 
 ```bash
-# Embedded build
-cargo build --features embedded
+# Embedded build (requires target specification)
+cargo build --features embedded --target thumbv7em-none-eabihf
 
 # Embedded release build, optimized for size
-cargo build --release --features embedded
+cargo build --release --features embedded --target thumbv7em-none-eabihf
 
-# Desktop unit tests
+# Desktop unit tests (runs on host target automatically)
 cargo test --test integration_test
 
 # Format and lint
@@ -529,30 +541,40 @@ cargo fmt
 cargo clippy
 
 # Fast compile check
-cargo check --features embedded
+cargo check --features embedded --target thumbv7em-none-eabihf
 ```
+
+### Feature Flags
+
+The project uses Cargo features to control which dependencies are included:
+
+| Feature   | Purpose                                             | Default |
+| --------- | --------------------------------------------------- | ------- |
+| `embedded` | Enables all embedded-specific dependencies          | No      |
+| `std`      | Enables standard library support (for testing)      | No      |
+| `nfc`      | Enables NFC pairing functionality                   | No      |
+
+The `embedded` feature includes Embassy runtime, defmt logging, and hardware-specific dependencies. Tests run without this feature to enable standard library support.
 
 ### Build Profile
 
 - Optimization: `-O s`
 - LTO: disabled by default
 - Codegen units: 1
-- Target: `thumbv7em-none-eabihf`
+- Target: `thumbv7em-none-eabihf` (must be specified for embedded builds)
 
 ### Flashing the Firmware
 
 ```bash
 # Build release binary
-cargo build --release --features embedded
+cargo build --release --features embedded --target thumbv7em-none-eabihf
 
 # Flash to board using probe-rs
 probe-rs download target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword
 
 # Or use cargo-flash shortcut
-cargo flash --release --features embedded
+cargo flash --release --features embedded --target thumbv7em-none-eabihf
 ```
-
----
 
 ## 5. Debugging with RTT
 
@@ -567,8 +589,6 @@ cargo run --release --features embedded
 ```
 
 Expected logs include sensor readings and thrust detection events.
-
----
 
 ## 6. References
 
@@ -590,8 +610,6 @@ Expected logs include sensor readings and thrust detection events.
 - Sensor Fusion
   - [Madgwick AHRS reference](https://github.com/arduino-libraries/MadgwickAHRS)
 
----
-
 ## 7. Architecture Decision Records
 
 ### ADR-1: NFC as Primary Pairing Gate
@@ -612,8 +630,6 @@ Expected logs include sensor readings and thrust detection events.
 - **Rationale**: Prevents accidental connection from other devices
 - **Alternative**: Require PIN each time, rejected because it has poor UX
 
----
-
 ## License
 
-MIT
+[MIT](./LICENSE)

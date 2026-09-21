@@ -27,12 +27,16 @@ name = "xiao_nrf52840_sword"
 required-features = ["embedded"]
 test = false # Exclude binary from test suite (lib-only tests)
 
+[[test]]
+name = "integration_test"
+harness = true
+
 [dependencies]
 # Core dependencies (lib-usable, std-compatible)
-# (none at the moment, all are embedded-specific)
+embedded-hal-async = "1.0.0"
 
 [dependencies.rnfc]
-version = "0.1"
+version = "0.1.0"
 optional = true
 
 [dependencies.embassy-time]
@@ -68,7 +72,7 @@ version = "0.2.2"
 optional = true
 
 [dependencies.cortex-m-rt]
-version = "0.7.5"
+version = "0.7.6"
 optional = true
 
 [dependencies.nrf52840-hal]
@@ -79,7 +83,6 @@ optional = true
 version = "0.10.6"
 optional = true
 
-embedded-hal-async = "0.3.0"
 
 [profile.release]
 opt-level = "s"

@@ -1,6 +1,4 @@
-[build]
-target = "thumbv7em-none-eabihf"
-
+# Configure embedded target for ARM Cortex-M builds
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 runner = "probe-rs run --chip nRF52840_xxAA"
 

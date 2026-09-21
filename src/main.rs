@@ -6,7 +6,7 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Instant, Timer};
+use embassy_time::Timer;
 use linked_list_allocator::LockedHeap;
 use lsm6ds3tr::interface::I2cInterface;
 use lsm6ds3tr::LSM6DS3TR;
@@ -18,9 +18,7 @@ use nrf52840_hal::{
 use panic_probe as _;
 
 // Re-export from lib module for use in main.rs
-use xiao_nrf52840_sword::{
-    detect_upward_thrust, NFC_PAIRING_TIMEOUT_SECS, SENSOR_SAMPLING_INTERVAL_MS,
-};
+use xiao_nrf52840_sword::{detect_upward_thrust, NFC_PAIRING_TIMEOUT_SECS, SENSOR_SAMPLING_INTERVAL_MS};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -132,6 +130,7 @@ fn animate_led_thrust(_duration_ms: u32) {
 
 /// Advertise to bonded device only
 /// TODO: Implement BLE radio initialization and advertising
+#[allow(dead_code)]
 fn ble_advertise_bonded_device(_mac: [u8; 6]) -> Result<(), &'static str> {
     info!("📡 BLE advertising to bonded device (stub - not yet implemented)");
     Ok(())
@@ -144,12 +143,13 @@ fn ble_advertise_bonded_device(_mac: [u8; 6]) -> Result<(), &'static str> {
 #[cfg(feature = "nfc")]
 mod nfc_pairing {
     use super::*;
+    use embassy_time::Instant;
 
     /// NFC Pairing Mode: wait for NFC field or timeout
     /// Returns true if NFC detected, false if timeout
     async fn nfc_pairing_mode() -> bool {
         info!("🔌 NFC Pairing Mode - Waiting for NFC reader...");
-        info!("   Timeout in {} seconds...", NFC_PAIRING_TIMEOUT_SECS);
+        info!("   Timeout in {} seconds...", super::NFC_PAIRING_TIMEOUT_SECS);
         info!("");
 
         let pairing_start = Instant::now();
@@ -176,6 +176,7 @@ mod nfc_pairing {
 #[cfg(not(feature = "nfc"))]
 fn nfc_pairing_mode_stub() -> bool {
     info!("⚠️  NFC pairing disabled - using Bluetooth fallback");
+    info!("   Timeout would be {} seconds", NFC_PAIRING_TIMEOUT_SECS);
     false
 }
 
