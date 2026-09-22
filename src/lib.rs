@@ -135,6 +135,7 @@ pub enum NfcPairingStatus {
 /// NFC Bonded Device Storage (6 bytes for MAC address)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "embedded", derive(defmt::Format))]
 pub struct BondedDevice {
     /// MAC address of the bonded device (6 bytes)
     pub mac: [u8; 6],
@@ -195,14 +196,15 @@ impl BondedDevice {
     }
 }
 
-/// NFC Field Detection
+/// NFC field and tag interaction.
 ///
-/// This module provides NFC field detection functionality for the nRF52840
-/// using the embassy-nrf NFCT peripheral for real hardware support.
-#[cfg(feature = "embedded")]
+/// Data types and synchronous helpers are available under both the `nfc` and
+/// `embedded` features so they can be used in desktop tests.  Async functions
+/// that depend on `embassy_time` are gated to `embedded` only.
+#[cfg(any(feature = "nfc", feature = "embedded"))]
 pub mod nfc {
+    #[cfg(feature = "embedded")]
     use super::*;
-    use embassy_time::Timer;
 
     /// NFC Field Detection State
     #[cfg_attr(feature = "embedded", derive(defmt::Format))]
@@ -218,259 +220,319 @@ pub mod nfc {
         Error,
     }
 
-    /// Detect NFC field presence with timeout
-    ///
-    /// This function uses the embassy-nrf NFCT peripheral to detect
-    /// when an NFC reader field is present. It will wait up to the
-    /// specified timeout duration for field detection.
-    ///
-    /// # Arguments
-    /// * `timeout_ms` - Maximum time to wait for field detection in milliseconds
-    ///
-    /// # Returns
-    /// * `true` if NFC field is detected within timeout
-    /// * `false` if timeout occurs without field detection
-    pub async fn detect_field_with_timeout(timeout_ms: u64) -> bool {
-        info!("📡 NFC Field Detection - Scanning for NFC tags...");
-        info!("   Timeout: {} ms", timeout_ms);
-
-        // This is a placeholder for the actual hardware implementation.
-        // The real implementation requires:
-        // 1. Access to embassy_nrf peripherals struct
-        // 2. NFCT interrupt handler setup
-        // 3. NfcT::new() with proper configuration
-        // 4. activate() call with timeout
-
-        info!("⚠️  Hardware NFCT peripheral requires main.rs integration");
-        info!("   This function needs embassy_nrf peripherals access");
-        Timer::after_millis(100).await;
-        false
-    }
-
-    /// Detect NFC field presence (default 500ms timeout)
-    ///
-    /// Convenience function with a reasonable default timeout for field detection.
-    pub async fn detect_field() -> bool {
-        detect_field_with_timeout(500).await
-    }
-
-    /// Read NFC field UID
-    ///
-    /// Returns the UID of the detected NFC tag (Type 2 Tag, 10 bytes)
-    /// Note: This requires the NFC peripheral to be properly initialized
-    pub async fn read_nfc_uid() -> Option<[u8; 10]> {
-        info!("📡 Reading NFC UID...");
-
-        // In production, this would use the NFCT peripheral to read the
-        // actual UID from the NFC reader after field detection
-
-        // Simulated NFC UID (10 bytes for Type 2 Tag)
-        let nfc_uid = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
-
-        info!("✅ NFC UID: {:?}", nfc_uid);
-        Some(nfc_uid)
-    }
-
-    /// Get current NFC field state
+    /// Get current NFC field state (always `Idle` until hardware drives it)
     pub fn get_field_state() -> NfcFieldState {
         NfcFieldState::Idle
     }
 
-    /// Set NFC field state
-    pub fn set_field_state(state: NfcFieldState) {
-        info!("NFC Field State: {:?}", state);
+    // ------------------------------------------------------------------
+    // Async helpers — only compiled when the embassy runtime is present
+    // ------------------------------------------------------------------
+
+    /// Detect NFC field presence with a custom timeout.
+    ///
+    /// The actual hardware activation is handled in `main.rs` via
+    /// `NfcT::activate()`.  This library-level stub exists so higher-level
+    /// pairing logic can call it without importing embassy-nrf directly.
+    ///
+    /// # Arguments
+    /// * `timeout_ms` – Maximum time to wait in milliseconds
+    ///
+    /// # Returns
+    /// `true` if an NFC field was detected within the timeout, `false` otherwise.
+    #[cfg(feature = "embedded")]
+    pub async fn detect_field_with_timeout(timeout_ms: u64) -> bool {
+        use embassy_time::Timer;
+
+        #[cfg(feature = "embedded")]
+        info!("📡 NFC Field Detection – timeout {} ms", timeout_ms);
+
+        // Hardware activation lives in main.rs (detect_nfc_field_real).
+        // This stub parks for one poll cycle and returns false so the
+        // higher-level pairing loop can keep polling with its own deadline.
+        Timer::after_millis(100).await;
+        false
+    }
+
+    /// Detect NFC field presence with the default 500 ms timeout.
+    #[cfg(feature = "embedded")]
+    pub async fn detect_field() -> bool {
+        detect_field_with_timeout(500).await
+    }
+
+    /// Read the 10-byte UID from the active NFC tag.
+    ///
+    /// The UID is available on the `NfcT` instance in `main.rs` after
+    /// `activate()` completes; this stub returns a placeholder until the
+    /// full NFCT read path is wired up.
+    #[cfg(feature = "embedded")]
+    pub async fn read_nfc_uid() -> Option<[u8; 10]> {
+        #[cfg(feature = "embedded")]
+        info!("📡 Reading NFC UID…");
+
+        // Placeholder: real implementation reads from NfcT after activation.
+        let uid = [0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+
+        #[cfg(feature = "embedded")]
+        info!("✅ NFC UID (stub): {:?}", uid);
+
+        Some(uid)
+    }
+
+    /// Read 4 bytes from a Type 2 tag page (pages 4–19).
+    #[cfg(feature = "embedded")]
+    pub async fn read_nfc_page(page: u8) -> Option<[u8; 4]> {
+        #[cfg(feature = "embedded")]
+        info!("📡 Reading NFC page {}", page);
+
+        let data = [0x00, 0x01, 0x02, 0x03];
+
+        #[cfg(feature = "embedded")]
+        info!("✅ NFC page {} data (stub): {:?}", page, data);
+
+        Some(data)
+    }
+
+    /// Write 4 bytes to a Type 2 tag page (pages 4–19).
+    #[cfg(feature = "embedded")]
+    pub async fn write_nfc_page(page: u8, data: &[u8; 4]) -> bool {
+        #[cfg(feature = "embedded")]
+        {
+            info!("📡 Writing NFC page {}", page);
+            info!("   Data: {:?}", data);
+            info!("✅ NFC page write (stub)");
+        }
+        #[cfg(not(feature = "embedded"))]
+        let _ = (page, data);
+        true
     }
 }
 
-/// NFC Pairing Functions
+/// NFC pairing and bonded-device management.
 ///
-/// These functions handle the complete NFC pairing flow:
-/// 1. Detect NFC field
-/// 2. Read bonded device MAC from flash
-/// 3. Authenticate the device
-/// 4. Establish secure connection
-#[cfg(feature = "embedded")]
+/// Pure data helpers and synchronous logic are available under both the `nfc`
+/// and `embedded` features.  Async pairing orchestration requires `embedded`.
+#[cfg(any(feature = "nfc", feature = "embedded"))]
 pub mod pairing {
     use super::*;
-    use embassy_time::{Duration, Instant, Timer};
 
-    /// NFC Pairing Mode: wait for NFC field or timeout
+    // ------------------------------------------------------------------
+    // Flash storage layout constants
+    // ------------------------------------------------------------------
+
+    /// Start address of the bonded-device storage region in flash.
+    pub const FLASH_BONDED_DEVICE_START: u32 = 0x2000;
+    /// Size of the bonded-device storage region (8 KB).
+    pub const FLASH_BONDED_DEVICE_SIZE: usize = 8 * 1024;
+    /// Byte size of one serialised `BondedDevice` (6 MAC + 4 timestamp + 1 flags).
+    pub const BONDED_DEVICE_STRUCT_SIZE: usize = 11;
+
+    // ------------------------------------------------------------------
+    // Synchronous helpers (available on host for testing)
+    // ------------------------------------------------------------------
+
+    /// Read the bonded device MAC from flash (stub; returns simulated value).
     ///
-    /// This function implements the primary pairing gate:
-    /// 1. Wait for NFC field presence (up to 15 seconds)
-    /// 2. If NFC detected, read bonded MAC and authenticate
-    /// 3. If timeout, fall back to Bluetooth mode
+    /// Real implementation will use the nRF52840 NVMC peripheral.
+    pub fn read_bonded_device_mac() -> Option<[u8; 6]> {
+        #[cfg(feature = "embedded")]
+        {
+            info!(
+                "🔑 Reading bonded MAC from flash (0x{:04X})",
+                FLASH_BONDED_DEVICE_START
+            );
+        }
+        Some([0x00, 11, 22, 33, 44, 55])
+    }
+
+    /// Read the full `BondedDevice` structure from flash (stub).
+    pub fn read_bonded_device() -> Option<BondedDevice> {
+        Some(BondedDevice {
+            mac: [0x00, 11, 22, 33, 44, 55],
+            timestamp: 1_234_567_890,
+            flags: 0b111,
+        })
+    }
+
+    /// Authenticate a device by comparing its MAC against the stored record.
     ///
-    /// Returns true if NFC pairing successful, false if timeout
-    pub async fn pairing_mode() -> bool {
-        info!("═══════════════════════════════════════════");
-        info!("🔌 NFC Pairing Mode - Primary Authentication Gate");
-        info!("═══════════════════════════════════════════");
-        info!("   Timeout in {} seconds...", NFC_PAIRING_TIMEOUT_SECS);
-        info!("");
+    /// A device passes authentication when:
+    /// - Its MAC matches the stored MAC exactly.
+    /// - The stored record is active (`flags` bit 0 set).
+    /// - The stored record is marked as paired (`flags` bit 1 set).
+    pub fn authenticate_bonded_device(mac: &[u8; 6]) -> bool {
+        #[cfg(feature = "embedded")]
+        info!("🔐 Authenticating device MAC: {:?}", mac);
 
-        let pairing_start = Instant::now();
-        let pairing_timeout = Duration::from_secs(NFC_PAIRING_TIMEOUT_SECS);
-
-        loop {
-            // Check for NFC field presence
-            if nfc::detect_field().await {
-                info!("✅ NFC field detected - initiating pairing sequence...");
-
-                // Read bonded device MAC from flash
-                if let Some(bonded_mac) = read_bonded_device_mac() {
-                    info!("🔑 Bonded device MAC: {:?}", bonded_mac);
-
-                    // In a real implementation, we would:
-                    // 1. Send the MAC to the paired mobile app
-                    // 2. Verify the MAC against stored credentials
-                    // 3. Establish secure BLE connection
-                    // 4. Store the pairing timestamp and flags
-
-                    info!("✅ Bonded device authentication successful");
-                    return true;
-                } else {
-                    warn!("⚠️  No bonded device MAC found in flash");
-                    info!("   Pairing failed - no bonded device registered");
-                    return false;
-                }
+        match read_bonded_device() {
+            Some(device) if device.mac == *mac && device.is_active() && device.is_paired() => {
+                #[cfg(feature = "embedded")]
+                info!("✅ Authentication successful");
+                true
             }
-
-            // Check for timeout
-            if pairing_start.elapsed() > pairing_timeout {
-                info!("⏱️  NFC pairing timeout - switching to Bluetooth mode");
-                info!("   Fallback to legacy BLE advertising");
-                return false;
+            _ => {
+                #[cfg(feature = "embedded")]
+                warn!("❌ Authentication failed – MAC not found or device not active/paired");
+                false
             }
-
-            // Wait before next check
-            Timer::after_millis(100).await;
         }
     }
 
-    /// Read bonded device MAC from flash memory
+    /// Return the current pairing status.
     ///
-    /// The nRF52840 has 512 KB of flash memory. We'll store the bonded
-    /// device MAC address in a dedicated region of flash.
-    pub fn read_bonded_device_mac() -> Option<[u8; 6]> {
-        info!("🔑 Reading bonded device MAC from flash...");
-
-        // In a real implementation, we would:
-        // 1. Use the nRF52840's flash controller to read from flash memory
-        // 2. Read the MAC address from the bonded device storage region
-        // 3. Validate the data (check timestamp, flags, etc.)
-        // 4. Return the MAC address if valid
-
-        // For now, we'll simulate reading a bonded MAC from flash
-        // In production, this would use the actual flash controller
-
-        // Simulated bonded MAC (would be read from flash in real hardware)
-        let bonded_mac = [0x00, 11, 22, 33, 44, 55];
-
-        info!("✅ Bonded MAC read: {:?}", bonded_mac);
-        Some(bonded_mac)
-    }
-
-    /// Authenticate bonded device
-    ///
-    /// Verifies the MAC address against stored credentials
-    pub fn authenticate_bonded_device(_mac: &[u8; 6]) -> bool {
-        info!("🔐 Authenticating bonded device...");
-
-        // In a real implementation, we would:
-        // 1. Compare the provided MAC with the stored MAC
-        // 2. Verify the timestamp is recent
-        // 3. Check the device flags
-        // 4. Return true if authentication succeeds
-
-        // For now, we'll simulate successful authentication
-        info!("✅ Authentication successful");
-        true
-    }
-
-    /// Get current pairing status
-    pub fn get_pairing_status() -> NfcPairingStatus {
+    /// This is a stateless stub; a full implementation would track state
+    /// in a shared atomic or mutex-protected variable.
+    pub fn get_nfc_pairing_status() -> NfcPairingStatus {
         NfcPairingStatus::Idle
     }
 
-    /// Set pairing status
-    pub fn set_pairing_status(status: NfcPairingStatus) {
-        info!("NFC Status: {:?}", status);
-    }
-
-    /// Write bonded device MAC to flash memory
-    ///
-    /// Stores the MAC address in the bonded device storage region
-    /// Flash offset: 0x2000 (8 KB region)
-    pub fn write_bonded_device_to_flash(_mac: &[u8; 6]) -> bool {
-        info!("💾 Writing bonded device MAC to flash...");
-
-        // In a real implementation, we would:
-        // 1. Use the nRF52840's flash controller to write to flash memory
-        // 2. Write the MAC address at offset 0x2000
-        // 3. Write timestamp at offset 0x2006
-        // 4. Write flags at offset 0x200C
-        // 5. Verify the write was successful
-
-        // For now, we'll simulate successful flash write
-        info!("✅ Bonded device MAC written to flash");
+    /// Write the bonded device MAC to flash (stub; logs intent).
+    pub fn write_bonded_device_to_flash(mac: &[u8; 6]) -> bool {
+        #[cfg(feature = "embedded")]
+        {
+            info!(
+                "💾 Writing bonded MAC to flash (0x{:04X})",
+                FLASH_BONDED_DEVICE_START
+            );
+            info!("   MAC: {:?}", mac);
+        }
+        #[cfg(not(feature = "embedded"))]
+        let _ = mac;
         true
     }
 
-    /// Register new bonded device
-    ///
-    /// Adds a new MAC address to the bonded device list
+    /// Write the full `BondedDevice` structure to flash (stub).
+    pub fn write_bonded_device_to_flash_full(device: &BondedDevice) -> bool {
+        #[cfg(feature = "embedded")]
+        {
+            info!(
+                "💾 Writing BondedDevice to flash (0x{:04X})",
+                FLASH_BONDED_DEVICE_START
+            );
+            info!("   Device: {:?}", device);
+        }
+        #[cfg(not(feature = "embedded"))]
+        let _ = device;
+        true
+    }
+
+    /// Register a new bonded device (stub; in production writes to NVMC).
     pub fn register_bonded_device(mac: &[u8; 6]) -> bool {
-        info!("📝 Registering new bonded device...");
-
-        // In a real implementation, we would:
-        // 1. Read existing bonded devices from flash
-        // 2. Check if MAC already exists
-        // 3. If new, write to flash storage
-        // 4. Return success
-
-        // For now, we'll simulate successful registration
-        info!("✅ New bonded device registered: {:?}", mac);
-        true
+        #[cfg(feature = "embedded")]
+        info!("📝 Registering bonded device MAC: {:?}", mac);
+        write_bonded_device_to_flash(mac)
     }
 
-    /// Unregister bonded device
-    ///
-    /// Removes a MAC address from the bonded device list
+    /// Unregister a bonded device by MAC (stub).
     pub fn unregister_bonded_device(mac: &[u8; 6]) -> bool {
-        info!("🗑️  Unregistering bonded device...");
-
-        // In a real implementation, we would:
-        // 1. Read existing bonded devices from flash
-        // 2. Remove the specified MAC
-        // 3. Write updated list to flash
-        // 4. Return success
-
-        // For now, we'll simulate successful unregistration
-        info!("✅ Bonded device unregistered: {:?}", mac);
+        #[cfg(feature = "embedded")]
+        info!("🗑️  Unregistering bonded device MAC: {:?}", mac);
+        #[cfg(not(feature = "embedded"))]
+        let _ = mac;
         true
     }
 
-    /// Get all bonded devices
-    ///
-    /// Returns a list of all registered bonded devices
+    /// Return all registered bonded devices (stub; returns two simulated entries).
     pub fn get_bonded_devices() -> [BondedDevice; 2] {
-        info!("📋 Reading bonded devices from flash...");
-
-        // In a real implementation, we would:
-        // 1. Read all bonded devices from flash
-        // 2. Return the list
-
-        // For now, we'll return a simulated list
         [
-            BondedDevice::new([0x00, 11, 22, 33, 44, 55]),
-            BondedDevice::new([0x00, 12, 23, 34, 45, 56]),
+            BondedDevice {
+                mac: [0x00, 11, 22, 33, 44, 55],
+                timestamp: 1_234_567_890,
+                flags: 0b111,
+            },
+            BondedDevice {
+                mac: [0x00, 12, 23, 34, 45, 56],
+                timestamp: 1_234_567_891,
+                flags: 0b111,
+            },
         ]
     }
 
-    /// Check if MAC is in bonded device list
+    /// Return `true` if `mac` is in the bonded device list.
     pub fn is_bonded_device(mac: &[u8; 6]) -> bool {
-        let devices = get_bonded_devices();
-        devices.iter().any(|d| d.mac == *mac)
+        get_bonded_devices().iter().any(|d| d.mac == *mac)
     }
+
+    // ------------------------------------------------------------------
+    // Async pairing orchestration — requires embassy runtime
+    // ------------------------------------------------------------------
+
+    /// Run the full NFC pairing gate.
+    ///
+    /// Waits up to `NFC_PAIRING_TIMEOUT_SECS` for an NFC field, then
+    /// reads and authenticates the bonded device MAC.  Returns `true` on
+    /// success, `false` on timeout or authentication failure.
+    #[cfg(feature = "embedded")]
+    pub async fn pairing_mode() -> bool {
+        use embassy_time::{Duration, Instant, Timer};
+
+        info!("═══════════════════════════════════════════");
+        info!("🔌 NFC Pairing Mode – Primary Authentication Gate");
+        info!("   Timeout: {} s", NFC_PAIRING_TIMEOUT_SECS);
+        info!("═══════════════════════════════════════════");
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(NFC_PAIRING_TIMEOUT_SECS);
+
+        loop {
+            if nfc::detect_field().await {
+                info!("✅ NFC field detected – initiating pairing…");
+
+                match read_bonded_device_mac() {
+                    Some(mac) => {
+                        if authenticate_bonded_device(&mac) {
+                            return true;
+                        } else {
+                            warn!("⚠️  Bonded device authentication failed");
+                            return false;
+                        }
+                    }
+                    None => {
+                        warn!("⚠️  No bonded device MAC in flash – pairing aborted");
+                        return false;
+                    }
+                }
+            }
+
+            if start.elapsed() > timeout {
+                info!("⏱️  NFC pairing timeout – falling back to BLE advertising");
+                return false;
+            }
+
+            Timer::after_millis(100).await;
+        }
+    }
+}
+
+// ============================================================================
+// TOP-LEVEL NFC API RE-EXPORTS
+//
+// The README documents these as top-level crate functions so callers don't
+// need to know whether they live in `pairing` or some other sub-module.
+// ============================================================================
+
+/// Verify a device MAC against the stored bonded device record.
+///
+/// Returns `true` when the MAC matches the stored record and the record is
+/// both active and paired.  Delegates to [`pairing::authenticate_bonded_device`].
+///
+/// # Example
+/// ```rust,ignore
+/// if authenticate_bonded_device(&mac) {
+///     // allow BLE connection
+/// }
+/// ```
+#[cfg(any(feature = "nfc", feature = "embedded"))]
+pub fn authenticate_bonded_device(mac: &[u8; 6]) -> bool {
+    pairing::authenticate_bonded_device(mac)
+}
+
+/// Return the current NFC pairing status.
+///
+/// Delegates to [`pairing::get_nfc_pairing_status`].  A full implementation
+/// would track state across the pairing flow; this stub always returns
+/// [`NfcPairingStatus::Idle`].
+#[cfg(any(feature = "nfc", feature = "embedded"))]
+pub fn get_nfc_pairing_status() -> NfcPairingStatus {
+    pairing::get_nfc_pairing_status()
 }
