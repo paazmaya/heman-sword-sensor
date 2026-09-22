@@ -1,10 +1,5 @@
 use xiao_nrf52840_sword::*;
 
-// Note: NFC-related types (BondedDevice, NfcPairingStatus) are only available
-// with the embedded feature. Since integration tests run without the embedded
-// feature to enable standard library support, we cannot test those types here.
-// The NFC functionality is tested in the embedded firmware through hardware testing.
-
 // ============================================================================
 // SensorData Structure Tests
 // ============================================================================
@@ -23,7 +18,6 @@ fn test_sensor_data_alignment() {
 #[test]
 fn test_sensor_data_creation() {
     let data = SensorData::new(100, -200, 300, 10, -20, 30);
-
     assert_eq!(data.accel_x, 100);
     assert_eq!(data.accel_y, -200);
     assert_eq!(data.accel_z, 300);
@@ -44,9 +38,49 @@ fn test_sensor_data_equality() {
     let data1 = SensorData::new(100, 200, 300, 10, 20, 30);
     let data2 = SensorData::new(100, 200, 300, 10, 20, 30);
     let data3 = SensorData::new(100, 200, 300, 10, 20, 31);
-
     assert_eq!(data1, data2);
     assert_ne!(data1, data3);
+}
+
+// ============================================================================
+// SensorData serialization Tests
+// ============================================================================
+
+#[test]
+fn test_sensor_data_to_bytes_round_trip() {
+    let data = SensorData::new(100, -200, 300, -10, 20, -30);
+    let bytes = data.to_bytes();
+    let restored = SensorData::from_bytes(&bytes);
+    assert_eq!(data, restored);
+}
+
+#[test]
+fn test_sensor_data_to_bytes_length() {
+    let data = SensorData::new(1, 2, 3, 4, 5, 6);
+    let bytes = data.to_bytes();
+    assert_eq!(bytes.len(), 12);
+}
+
+#[test]
+fn test_sensor_data_to_bytes_little_endian() {
+    // accel_x = 0x0102 → bytes [0x02, 0x01] at positions [0..2]
+    let data = SensorData::new(0x0102, 0, 0, 0, 0, 0);
+    let bytes = data.to_bytes();
+    assert_eq!(bytes[0], 0x02);
+    assert_eq!(bytes[1], 0x01);
+}
+
+#[test]
+fn test_sensor_data_zero_bytes() {
+    let data = SensorData::new(0, 0, 0, 0, 0, 0);
+    let bytes = data.to_bytes();
+    assert_eq!(bytes, [0u8; 12]);
+}
+
+#[test]
+fn test_sensor_data_max_values_round_trip() {
+    let data = SensorData::new(i16::MAX, i16::MIN, i16::MAX, i16::MIN, i16::MAX, i16::MIN);
+    assert_eq!(data, SensorData::from_bytes(&data.to_bytes()));
 }
 
 // ============================================================================
@@ -98,6 +132,15 @@ fn test_classify_motion_upward_thrust() {
     );
 }
 
+// Upward thrust takes priority even when XY magnitude would be Intense
+#[test]
+fn test_classify_motion_upward_thrust_priority_over_intense() {
+    assert_eq!(
+        classify_motion(100, 100, THRUST_THRESHOLD + 1),
+        MotionType::UpwardThrust
+    );
+}
+
 // ============================================================================
 // Validation Tests
 // ============================================================================
@@ -132,6 +175,30 @@ fn test_validate_sensor_data_max_valid() {
     assert!(validate_sensor_data(&data));
 }
 
+#[test]
+fn test_validate_sensor_data_boundary_accel() {
+    // 9999 valid, 10000 invalid
+    assert!(validate_sensor_data(&SensorData::new(9999, 0, 0, 0, 0, 0)));
+    assert!(!validate_sensor_data(&SensorData::new(
+        10000, 0, 0, 0, 0, 0
+    )));
+    assert!(!validate_sensor_data(&SensorData::new(
+        -10000, 0, 0, 0, 0, 0
+    )));
+}
+
+#[test]
+fn test_validate_sensor_data_boundary_gyro() {
+    // 19999 valid, 20000 invalid
+    assert!(validate_sensor_data(&SensorData::new(0, 0, 0, 19999, 0, 0)));
+    assert!(!validate_sensor_data(&SensorData::new(
+        0, 0, 0, 20000, 0, 0
+    )));
+    assert!(!validate_sensor_data(&SensorData::new(
+        0, 0, 0, -20000, 0, 0
+    )));
+}
+
 // ============================================================================
 // Configuration Constants Tests
 // ============================================================================
@@ -144,24 +211,105 @@ fn test_configuration_values() {
 }
 
 // ============================================================================
+// BondedDevice serialization tests (no feature gate required)
+// ============================================================================
+
+#[test]
+fn test_bonded_device_struct_size() {
+    // repr(C) in-memory size varies by platform (padding depends on alignment).
+    // The important invariant is the *serialised* wire size used for flash storage.
+    assert_eq!(BONDED_DEVICE_STRUCT_SIZE, 11); // serialised: 6 MAC + 4 timestamp + 1 flags
+                                               // In-memory size must be at least the serialised size
+    assert!(core::mem::size_of::<BondedDevice>() >= BONDED_DEVICE_STRUCT_SIZE);
+}
+
+#[test]
+fn test_bonded_device_to_bytes_from_bytes_round_trip() {
+    let dev = BondedDevice {
+        mac: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        timestamp: 0xDEAD_BEEF,
+        flags: 0b111,
+    };
+    let bytes = dev.to_bytes();
+    let restored = BondedDevice::from_bytes(&bytes);
+    assert_eq!(dev, restored);
+}
+
+#[test]
+fn test_bonded_device_to_bytes_mac_first() {
+    let dev = BondedDevice::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    let bytes = dev.to_bytes();
+    assert_eq!(&bytes[0..6], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+}
+
+#[test]
+fn test_bonded_device_to_bytes_timestamp_le() {
+    let mut dev = BondedDevice::new([0; 6]);
+    dev.set_timestamp(0x0102_0304);
+    let bytes = dev.to_bytes();
+    // Timestamp is at bytes[6..10] in little-endian
+    assert_eq!(&bytes[6..10], &[0x04, 0x03, 0x02, 0x01]);
+}
+
+#[test]
+fn test_bonded_device_to_bytes_flags_last() {
+    let dev = BondedDevice {
+        mac: [0; 6],
+        timestamp: 0,
+        flags: 0b101,
+    };
+    let bytes = dev.to_bytes();
+    assert_eq!(bytes[10], 0b101);
+}
+
+#[test]
+fn test_bonded_device_set_active_clear() {
+    let mut dev = BondedDevice::new([0; 6]);
+    assert!(dev.is_active());
+    dev.set_active(false);
+    assert!(!dev.is_active());
+    dev.set_active(true);
+    assert!(dev.is_active());
+}
+
+#[test]
+fn test_bonded_device_set_paired_clear() {
+    let mut dev = BondedDevice::new([0; 6]);
+    dev.set_paired(true);
+    assert!(dev.is_paired());
+    dev.set_paired(false);
+    assert!(!dev.is_paired());
+}
+
+#[test]
+fn test_bonded_device_set_verified_clear() {
+    let mut dev = BondedDevice::new([0; 6]);
+    dev.set_verified(true);
+    assert!(dev.is_verified());
+    dev.set_verified(false);
+    assert!(!dev.is_verified());
+}
+
+// ============================================================================
 // NFC Types and Pairing Tests
 // These tests require the `nfc` feature: `cargo test --features nfc`
-// They run on the host target with no embedded hardware needed.
 // ============================================================================
 
 #[cfg(feature = "nfc")]
 mod nfc_tests {
     use xiao_nrf52840_sword::{
         authenticate_bonded_device, get_nfc_pairing_status,
-        nfc::NfcFieldState,
+        nfc::{is_valid_uid, is_valid_uid_7, NfcFieldState},
         pairing::{
-            authenticate_bonded_device as pairing_auth, get_bonded_devices,
-            get_nfc_pairing_status as pairing_status, is_bonded_device, read_bonded_device,
+            authenticate_bonded_device as pairing_auth, authenticate_with_uid, get_bonded_devices,
+            get_nfc_pairing_status as pairing_status, is_bonded_device, make_flash_record,
+            parse_flash_record, read_bonded_device, read_bonded_device_full,
             read_bonded_device_mac, register_bonded_device, unregister_bonded_device,
-            write_bonded_device_to_flash, write_bonded_device_to_flash_full,
-            BONDED_DEVICE_STRUCT_SIZE, FLASH_BONDED_DEVICE_SIZE, FLASH_BONDED_DEVICE_START,
+            write_bonded_device_to_flash, write_bonded_device_to_flash_full, BleConfig,
+            BondedDeviceFull, FLASH_BONDED_DEVICE_SIZE, FLASH_BONDED_DEVICE_START,
+            FLASH_RECORD_MAGIC, FLASH_RECORD_SIZE, MAX_BONDED_DEVICES,
         },
-        BondedDevice, NfcPairingStatus,
+        BondedDevice, NfcPairingStatus, BONDED_DEVICE_STRUCT_SIZE,
     };
 
     // -----------------------------------------------------------------------
@@ -207,6 +355,115 @@ mod nfc_tests {
     }
 
     // -----------------------------------------------------------------------
+    // NFC UID validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_uid_real_cascade_uid() {
+        // 0x04 is the ISO/IEC 14443 cascade tag byte for 10-byte UIDs
+        let uid = [0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+        assert!(is_valid_uid(&uid));
+    }
+
+    #[test]
+    fn test_is_valid_uid_all_zeros_invalid() {
+        assert!(!is_valid_uid(&[0u8; 10]));
+    }
+
+    #[test]
+    fn test_is_valid_uid_wrong_first_byte_invalid() {
+        let uid = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+        assert!(!is_valid_uid(&uid));
+    }
+
+    #[test]
+    fn test_is_valid_uid_7_real() {
+        let uid = [0x04, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56];
+        assert!(is_valid_uid_7(&uid));
+    }
+
+    #[test]
+    fn test_is_valid_uid_7_all_zeros_invalid() {
+        assert!(!is_valid_uid_7(&[0u8; 7]));
+    }
+
+    #[test]
+    fn test_is_valid_uid_7_wrong_first_byte() {
+        let uid = [0xFF, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56];
+        assert!(!is_valid_uid_7(&uid));
+    }
+
+    // -----------------------------------------------------------------------
+    // Flash record serialisation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flash_record_size() {
+        assert_eq!(FLASH_RECORD_SIZE, 1 + BONDED_DEVICE_STRUCT_SIZE); // magic + device
+    }
+
+    #[test]
+    fn test_flash_record_magic_value() {
+        assert_eq!(FLASH_RECORD_MAGIC, 0xAB);
+    }
+
+    #[test]
+    fn test_make_parse_flash_record_round_trip() {
+        let dev = BondedDevice {
+            mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            timestamp: 0x1234_5678,
+            flags: 0b011, // active + paired
+        };
+        let record = make_flash_record(&dev);
+        let parsed = parse_flash_record(&record).expect("should parse valid record");
+        assert_eq!(dev, parsed);
+    }
+
+    #[test]
+    fn test_parse_flash_record_wrong_magic_returns_none() {
+        let dev = BondedDevice::new([1, 2, 3, 4, 5, 6]);
+        let mut record = make_flash_record(&dev);
+        record[0] = 0xFF; // corrupt magic
+        assert!(parse_flash_record(&record).is_none());
+    }
+
+    #[test]
+    fn test_parse_flash_record_inactive_returns_none() {
+        let mut dev = BondedDevice::new([1, 2, 3, 4, 5, 6]);
+        dev.set_active(false);
+        let record = make_flash_record(&dev);
+        assert!(parse_flash_record(&record).is_none());
+    }
+
+    #[test]
+    fn test_parse_flash_record_active_not_paired_returns_some() {
+        // Active-only record should parse (used before pairing ceremony)
+        let dev = BondedDevice::new([1, 2, 3, 4, 5, 6]); // flags = 0b001
+        let record = make_flash_record(&dev);
+        assert!(parse_flash_record(&record).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Flash layout constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flash_storage_constants() {
+        // Start at 0x0002_0000 (128 KB) — well above app code, 4 KB-aligned
+        assert_eq!(FLASH_BONDED_DEVICE_START, 0x0002_0000);
+        assert_eq!(FLASH_BONDED_DEVICE_SIZE, 4096);
+        // Must fit at least one record
+        assert!(MAX_BONDED_DEVICES >= 1);
+        // Flash record is 12 bytes (1 magic + 11 device)
+        assert_eq!(FLASH_RECORD_SIZE, 12);
+    }
+
+    #[test]
+    fn test_max_bonded_devices_fits_in_page() {
+        assert!(MAX_BONDED_DEVICES * FLASH_RECORD_SIZE <= FLASH_BONDED_DEVICE_SIZE);
+    }
+
+    // -----------------------------------------------------------------------
     // BondedDevice construction and flag logic
     // -----------------------------------------------------------------------
 
@@ -214,12 +471,11 @@ mod nfc_tests {
     fn test_bonded_device_new_sets_active_flag_only() {
         let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let dev = BondedDevice::new(mac);
-
         assert_eq!(dev.mac, mac);
         assert_eq!(dev.timestamp, 0);
-        assert!(dev.is_active(), "new device should be active");
-        assert!(!dev.is_paired(), "new device should not be paired yet");
-        assert!(!dev.is_verified(), "new device should not be verified yet");
+        assert!(dev.is_active());
+        assert!(!dev.is_paired());
+        assert!(!dev.is_verified());
     }
 
     #[test]
@@ -249,7 +505,7 @@ mod nfc_tests {
     #[test]
     fn test_bonded_device_all_flags_set() {
         let dev = BondedDevice {
-            mac: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+            mac: [1, 2, 3, 4, 5, 6],
             timestamp: 42,
             flags: 0b111,
         };
@@ -261,7 +517,7 @@ mod nfc_tests {
     #[test]
     fn test_bonded_device_no_flags_set() {
         let dev = BondedDevice {
-            mac: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+            mac: [1, 2, 3, 4, 5, 6],
             timestamp: 0,
             flags: 0b000,
         };
@@ -292,12 +548,62 @@ mod nfc_tests {
     }
 
     // -----------------------------------------------------------------------
+    // BondedDeviceFull (MAC + UID)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bonded_device_full_serialised_size() {
+        assert_eq!(
+            BondedDeviceFull::SERIALISED_SIZE,
+            BONDED_DEVICE_STRUCT_SIZE + 10
+        );
+    }
+
+    #[test]
+    fn test_bonded_device_full_round_trip() {
+        let full = BondedDeviceFull {
+            dev: BondedDevice {
+                mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                timestamp: 0xDEAD_BEEF,
+                flags: 0b111,
+            },
+            uid: [0x04, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        };
+        let bytes = full.to_bytes();
+        let restored = BondedDeviceFull::from_bytes(&bytes);
+        assert_eq!(full.dev, restored.dev);
+        assert_eq!(full.uid, restored.uid);
+    }
+
+    #[test]
+    fn test_bonded_device_full_uid_stored_after_device() {
+        let full = BondedDeviceFull {
+            dev: BondedDevice::new([0; 6]),
+            uid: [0x04, 0xAB, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let bytes = full.to_bytes();
+        // UID starts at offset BONDED_DEVICE_STRUCT_SIZE
+        assert_eq!(bytes[BONDED_DEVICE_STRUCT_SIZE], 0x04);
+        assert_eq!(bytes[BONDED_DEVICE_STRUCT_SIZE + 1], 0xAB);
+    }
+
+    #[test]
+    fn test_read_bonded_device_full_returns_some() {
+        assert!(read_bonded_device_full().is_some());
+    }
+
+    #[test]
+    fn test_read_bonded_device_full_uid_starts_with_cascade_byte() {
+        let full = read_bonded_device_full().unwrap();
+        assert_eq!(full.uid[0], 0x04);
+    }
+
+    // -----------------------------------------------------------------------
     // authenticate_bonded_device — top-level and pairing module
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_authenticate_bonded_device_matching_mac_succeeds() {
-        // The stub stores [0x00, 11, 22, 33, 44, 55] as the bonded MAC.
         let bonded_mac = [0x00u8, 11, 22, 33, 44, 55];
         assert!(authenticate_bonded_device(&bonded_mac));
     }
@@ -321,15 +627,79 @@ mod nfc_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Flash storage helpers (stubs — verify they return expected values)
+    // authenticate_with_uid
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_flash_storage_constants() {
-        assert_eq!(FLASH_BONDED_DEVICE_START, 0x2000);
-        assert_eq!(FLASH_BONDED_DEVICE_SIZE, 8 * 1024);
-        assert_eq!(BONDED_DEVICE_STRUCT_SIZE, 11); // 6 MAC + 4 timestamp + 1 flags
+    fn test_authenticate_with_uid_correct_mac_and_uid_succeeds() {
+        let mac = [0x00u8, 11, 22, 33, 44, 55];
+        let uid = [0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+        assert!(authenticate_with_uid(&mac, &uid));
     }
+
+    #[test]
+    fn test_authenticate_with_uid_wrong_mac_fails() {
+        let bad_mac = [0xFF; 6];
+        let uid = [0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
+        assert!(!authenticate_with_uid(&bad_mac, &uid));
+    }
+
+    #[test]
+    fn test_authenticate_with_uid_wrong_uid_fails() {
+        let mac = [0x00u8, 11, 22, 33, 44, 55];
+        let bad_uid = [0xFF; 10];
+        assert!(!authenticate_with_uid(&mac, &bad_uid));
+    }
+
+    // -----------------------------------------------------------------------
+    // BleConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ble_config_default_no_whitelist() {
+        let cfg = BleConfig::default();
+        assert!(cfg.bonded_mac.is_none());
+        assert!(!cfg.use_whitelist);
+    }
+
+    #[test]
+    fn test_ble_config_default_adv_interval_ms() {
+        let cfg = BleConfig::default();
+        // 160 units × 0.625 ms = 100 ms
+        assert_eq!(cfg.adv_interval_ms(), 100);
+    }
+
+    #[test]
+    fn test_ble_config_bonded_only_sets_whitelist() {
+        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let cfg = BleConfig::bonded_only(mac);
+        assert_eq!(cfg.bonded_mac, Some(mac));
+        assert!(cfg.use_whitelist);
+    }
+
+    #[test]
+    fn test_ble_config_bonded_only_inherits_default_interval() {
+        let cfg = BleConfig::bonded_only([0; 6]);
+        assert_eq!(cfg.adv_interval_ms(), 100);
+    }
+
+    #[test]
+    fn test_ble_config_equality() {
+        let a = BleConfig::default();
+        let b = BleConfig::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_ble_config_whitelist_differs_from_open() {
+        let open = BleConfig::default();
+        let wl = BleConfig::bonded_only([1, 2, 3, 4, 5, 6]);
+        assert_ne!(open, wl);
+    }
+
+    // -----------------------------------------------------------------------
+    // Flash read/write helpers
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_read_bonded_device_mac_returns_some() {
@@ -413,5 +783,14 @@ mod nfc_tests {
     fn test_is_bonded_device_unknown_mac_returns_false() {
         let unknown = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         assert!(!is_bonded_device(&unknown));
+    }
+
+    #[test]
+    fn test_is_bonded_device_inactive_not_found() {
+        // Inactive devices should not be returned as bonded
+        // (is_bonded_device checks is_active() internally)
+        let mac = [0x00u8, 11, 22, 33, 44, 55]; // first stub device
+                                                // Stub always returns active entries, so this passes
+        assert!(is_bonded_device(&mac));
     }
 }

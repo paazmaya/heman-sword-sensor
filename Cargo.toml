@@ -11,6 +11,7 @@ embedded = [
   "embassy-time",
   "embassy-executor",
   "embassy-sync",
+  "embassy-futures",
   "defmt",
   "defmt-rtt",
   "panic-probe",
@@ -19,6 +20,9 @@ embedded = [
   "embassy-nrf",
   "linked_list_allocator",
   "static_cell",
+  "embedded-storage",
+  "nrf-softdevice",
+  "nrf-softdevice-s140",
 ]
 # NFC feature: enables NFC pairing/bonding logic (no embedded hardware required)
 nfc = []
@@ -52,16 +56,20 @@ optional = true
 version = "0.8.0"
 optional = true
 
+[dependencies.embassy-futures]
+version = "0.1"
+optional = true
+
 [dependencies.defmt]
-version = "0.3"
+version = "1.0"
 optional = true
 
 [dependencies.defmt-rtt]
-version = "0.4"
+version = "1.0"
 optional = true
 
 [dependencies.panic-probe]
-version = "0.2"
+version = "1.0"
 optional = true
 
 [dependencies.lsm6ds3tr]
@@ -84,6 +92,32 @@ optional = true
 
 [dependencies.static_cell]
 version = "2.1"
+optional = true
+
+# embedded-storage: NorFlash trait for NVMC flash operations
+[dependencies.embedded-storage]
+version = "0.3.1"
+optional = true
+
+# nrf-softdevice: Pure-Rust async BLE bindings for the nRF52840 S140 SoftDevice.
+# Uses git source to get embassy-sync 0.8 compatibility (aligned with our project).
+[dependencies.nrf-softdevice]
+git = "https://github.com/embassy-rs/nrf-softdevice.git"
+default-features = false
+features = [
+  "nrf52840",
+  "s140",
+  "ble-peripheral",
+  "ble-gatt-server",
+  "ble-gatt",
+  "defmt",
+  "critical-section-impl",
+]
+optional = true
+
+# S140 SoftDevice FFI bindings (Nordic's pre-compiled BLE stack for nRF52840)
+[dependencies.nrf-softdevice-s140]
+git = "https://github.com/embassy-rs/nrf-softdevice.git"
 optional = true
 
 
