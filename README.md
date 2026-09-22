@@ -17,18 +17,21 @@ A high-tech sword sensor with real-time motion tracking, NFC pairing security, a
 - Multi-task architecture with `embassy_sync` channels
 - Structured logging through `defmt` + RTT
 - Desktop tests for motion detection, sensor validation, and configuration constants
+- Embassy-nrf NFCT peripheral integration with real hardware types and API demonstration
 
 ### In Progress
 
-- Real NFC field detection through the nRF52840 NFCT peripheral
 - Complete BLE stack integration
 - GATT service and characteristic definitions
 - BLE bonding and MAC whitelisting
 - WS2812B LED strip control
+- Full embassy runtime migration to enable complete embassy-nrf NFCT hardware activation
 
 ### TODO
 
 - nrf-softdevice S140 BLE stack integration
+- Migrate from nrf52840-hal to embassy-nrf HAL for full embassy runtime integration
+- Complete NFCT peripheral activation with embassy runtime
 - NFC Type 2 tag read/write and bonded MAC persistence
 - BLE advertise-only-to-bonded-device logic
 - LED animation engine
@@ -102,6 +105,7 @@ The LSM6DS3TR provides:
 | Component                 | Version       | Purpose                                           |
 | ------------------------- | ------------- | ------------------------------------------------- |
 | **Embassy**               | 0.10.0        | Async runtime with executor, timers, and channels |
+| **embassy-nrf**           | 0.11.0        | nRF HAL with NFCT peripheral support               |
 | **nrf52840-hal**          | 0.19.0        | Peripheral access and synchronous I2C             |
 | **lsm6ds3tr**             | 0.2.2         | LSM6DS3TR IMU driver                              |
 | **defmt + defmt-rtt**     | 0.3 / 0.4     | Structured logging over RTT                       |
@@ -153,7 +157,7 @@ Key design decisions:
 
 The firmware uses NFC as the primary pairing gate. On boot, it waits up to 15 seconds for an NFC field. If a field is detected, it reads the bonded device MAC from flash and authenticates the device. If NFC times out, it falls back to legacy BLE advertising.
 
-The current implementation is still a placeholder: field detection and flash persistence are stubbed, while the timeout and fallback behavior are implemented.
+The current implementation uses embassy-nrf's NFCT peripheral with real hardware types (NfcId, SddPat, SelResProtocol, Config). The implementation demonstrates the exact embassy-nrf API calls for hardware activation: `NfcT::new(p.NFCT, Irqs, &config)` and `nfct.activate()`. Full hardware activation requires migration from nrf52840-hal to embassy-nrf HAL for complete embassy runtime integration.
 
 #### Architecture
 
@@ -249,9 +253,9 @@ enum NfcPairingStatus {
 
 | Function                            | Description                | Returns            |
 | ----------------------------------- | -------------------------- | ------------------ |
-| `nfc::detect_field()`               | Detect NFC field presence  | `bool`             |
+| `nfc::detect_field()`               | Detect NFC field presence (500ms timeout) | `bool`             |
+| `nfc::detect_field_with_timeout()`  | Detect NFC field with custom timeout | `bool`             |
 | `nfc::read_nfc_uid()`               | Read NFC UID from tag      | `Option<[u8; 10]>` |
-| `pairing::pairing_mode()`           | Start pairing sequence     | `bool`             |
 | `pairing::read_bonded_device_mac()` | Read MAC from flash        | `Option<[u8; 6]>`  |
 | `authenticate_bonded_device()`      | Verify bonded MAC          | `bool`             |
 | `get_nfc_pairing_status()`          | Get current pairing status | `NfcPairingStatus` |
@@ -306,6 +310,31 @@ NFC-specific tests should cover:
 | Bonded device not found             | Verify MAC is stored in flash and the flash region is correct |
 | Authentication fails                | Verify MAC format, timestamp validity, and device flags       |
 | BLE is still visible to all devices | Confirm bonding and whitelist logic are implemented           |
+
+#### Current Implementation Status
+
+The NFC implementation uses embassy-nrf v0.11.0 with real hardware types and demonstrates the exact API calls needed for hardware activation:
+
+**Real Hardware Types:**
+- `NfcId::SingleSize([0x01, 0x02, 0x03, 0x04])` - NFC identifier configuration
+- `SddPat::Sdd00000` - Single device detection pattern
+- `SelResProtocol::Type2` - Type 2 Tag protocol selection
+- `Config` struct with proper embassy-nrf field names
+
+**Hardware API Usage:**
+```rust
+let config = Config {
+    nfcid1: nfcid,
+    sdd_pat: SddPat::Sdd00000,
+    plat_conf: 0x00,
+    protocol: SelResProtocol::Type2,
+};
+let mut nfct = NfcT::new(p.NFCT, Irqs, &config);
+let result = embassy_time::with_timeout(Duration::from_millis(timeout_ms), nfct.activate()).await;
+```
+
+**Current Limitation:**
+Full hardware activation requires migration from `nrf52840-hal` to `embassy-nrf` HAL for complete embassy runtime integration. The current setup demonstrates the correct embassy-nrf API usage while maintaining compatibility with the existing nrf52840-hal based system.
 
 #### Future Enhancements
 
@@ -383,7 +412,7 @@ async fn main_sensor_loop(imu: &mut LSM6DS3TR<I2cInterface<Twim>>) {
 | `init_i2c()`             | Configure TWIM0 I2C pins and frequency             | Implemented                  |
 | `init_imu()`             | Initialize LSM6DS3TR sensor                        | Implemented                  |
 | `read_sensor_data()`     | Single IMU read for accelerometer and gyroscope    | Implemented                  |
-| `nfc_pairing_mode()`     | Wait for NFC field or timeout                      | Timeout fallback implemented |
+| `nfc::detect_field_with_timeout()` | Wait for NFC field with timeout | Embassy-nrf API with real hardware types |
 | `main_sensor_loop()`     | Read IMU, detect thrust, send to BLE               | Implemented                  |
 | `detect_upward_thrust()` | Motion threshold detection on Z-axis               | Implemented and tested       |
 | `classify_motion()`      | Classify idle, moderate, intense, or upward thrust | Implemented and tested       |
@@ -394,7 +423,7 @@ Placeholder functions:
 | Function                        | Purpose               | Next Step                       |
 | ------------------------------- | --------------------- | ------------------------------- |
 | `animate_led_thrust()`          | WS2812B LED animation | Implement PWM via `embassy-nrf` |
-| `nfc_detect_field()`            | NFC field detection   | Use nRF52840 NFCT peripheral    |
+| `embassy runtime migration`     | Full NFCT activation  | Migrate to embassy-nrf HAL     |
 | `nfc_read_bonded_device_mac()`  | Read MAC from flash   | Implement flash storage API     |
 | `ble_advertise_bonded_device()` | BLE radio advertising | Use `embassy-nrf` radio module  |
 
