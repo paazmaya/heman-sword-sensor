@@ -449,13 +449,31 @@ mod nfc_tests {
 
     #[test]
     fn test_flash_storage_constants() {
-        // Start at 0x0002_0000 (128 KB) — well above app code, 4 KB-aligned
-        assert_eq!(FLASH_BONDED_DEVICE_START, 0x0002_0000);
+        // Last 4 KB page of 1 MB flash: 0x000F_F000 − 0x1000 = 0x000E_F000.
+        // Placing storage here ensures it never overlaps the S140 SoftDevice
+        // region (0x00000000–0x00025FFF) or application code.
+        assert_eq!(FLASH_BONDED_DEVICE_START, 0x000E_F000);
+        // Must be 4 KB-page-aligned
+        assert_eq!(FLASH_BONDED_DEVICE_START % 4096, 0);
         assert_eq!(FLASH_BONDED_DEVICE_SIZE, 4096);
         // Must fit at least one record
         assert!(MAX_BONDED_DEVICES >= 1);
         // Flash record is 12 bytes (1 magic + 11 device)
         assert_eq!(FLASH_RECORD_SIZE, 12);
+    }
+
+    #[test]
+    fn test_flash_start_above_softdevice_region() {
+        // S140 SoftDevice occupies 0x00000000–0x00025FFF (152 KB).
+        // Our storage must start above this boundary.
+        assert!(FLASH_BONDED_DEVICE_START >= 0x0002_6000);
+    }
+
+    #[test]
+    fn test_flash_region_within_flash_bounds() {
+        // nRF52840 has 1 MB flash (0x000F_FFFF end).
+        let end = FLASH_BONDED_DEVICE_START + FLASH_BONDED_DEVICE_SIZE as u32;
+        assert!(end <= 0x0010_0000);
     }
 
     #[test]
@@ -792,5 +810,296 @@ mod nfc_tests {
         let mac = [0x00u8, 11, 22, 33, 44, 55]; // first stub device
                                                 // Stub always returns active entries, so this passes
         assert!(is_bonded_device(&mac));
+    }
+}
+
+// ============================================================================
+// NFC UID extraction and parsing tests (available without any feature flag
+// because extract_uid_from_nfct and parse_nfct_uid are now host-testable)
+// ============================================================================
+
+#[cfg(feature = "nfc")]
+mod nfc_uid_tests {
+    use xiao_nrf52840_sword::nfc::{extract_uid_from_nfct, parse_nfct_uid};
+
+    // -----------------------------------------------------------------------
+    // extract_uid_from_nfct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_uid_empty_returns_none() {
+        assert!(extract_uid_from_nfct(&[]).is_none());
+    }
+
+    #[test]
+    fn test_extract_uid_all_zeros_returns_none() {
+        assert!(extract_uid_from_nfct(&[0x00, 0x00, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn test_extract_uid_single_size_4_bytes_pads_to_10() {
+        let raw = [0x04u8, 0x01, 0x02, 0x03];
+        let uid = extract_uid_from_nfct(&raw).expect("should succeed");
+        assert_eq!(uid.len(), 10);
+        // First 4 bytes copied from raw, remainder zero-padded
+        assert_eq!(&uid[..4], &raw[..]);
+        assert_eq!(&uid[4..], &[0u8; 6]);
+    }
+
+    #[test]
+    fn test_extract_uid_double_size_7_bytes() {
+        let raw = [0x04u8, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56];
+        let uid = extract_uid_from_nfct(&raw).expect("should succeed");
+        assert_eq!(&uid[..7], &raw[..]);
+        assert_eq!(&uid[7..], &[0u8; 3]);
+    }
+
+    #[test]
+    fn test_extract_uid_triple_size_10_bytes() {
+        let raw = [0x04u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let uid = extract_uid_from_nfct(&raw).expect("should succeed");
+        assert_eq!(uid, raw);
+    }
+
+    #[test]
+    fn test_extract_uid_more_than_10_bytes_truncated() {
+        // Only first 10 bytes are used
+        let raw = [0x04u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let uid = extract_uid_from_nfct(&raw).expect("should succeed");
+        assert_eq!(&uid[..], &raw[..10]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_nfct_uid — validates cascade byte in addition to extracting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_nfct_uid_valid_4_byte_cascade() {
+        let raw = [0x04u8, 0x01, 0x02, 0x03];
+        let uid = parse_nfct_uid(&raw).expect("should parse");
+        assert_eq!(uid[0], 0x04);
+    }
+
+    #[test]
+    fn test_parse_nfct_uid_valid_10_byte() {
+        let raw = [0x04u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert!(parse_nfct_uid(&raw).is_some());
+    }
+
+    #[test]
+    fn test_parse_nfct_uid_wrong_cascade_byte_returns_none() {
+        // First byte is 0x00, not 0x04 — invalid
+        let raw = [0x00u8, 0x01, 0x02, 0x03];
+        assert!(parse_nfct_uid(&raw).is_none());
+    }
+
+    #[test]
+    fn test_parse_nfct_uid_all_zeros_returns_none() {
+        assert!(parse_nfct_uid(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn test_parse_nfct_uid_empty_returns_none() {
+        assert!(parse_nfct_uid(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_nfct_uid_7_byte_valid() {
+        let raw = [0x04u8, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56];
+        let uid = parse_nfct_uid(&raw).expect("should parse 7-byte UID");
+        assert_eq!(uid[0], 0x04);
+        assert_eq!(uid[1], 0xAB);
+        assert_eq!(&uid[7..], &[0u8; 3]); // zero-padded
+    }
+
+    #[test]
+    fn test_parse_nfct_uid_7_byte_wrong_cascade_returns_none() {
+        let raw = [0xFFu8, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56];
+        assert!(parse_nfct_uid(&raw).is_none());
+    }
+
+    #[test]
+    fn test_extract_and_parse_agree_on_valid_uid() {
+        let raw = [0x04u8, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03, 0x04];
+        let extracted = extract_uid_from_nfct(&raw).unwrap();
+        let parsed = parse_nfct_uid(&raw).unwrap();
+        assert_eq!(extracted, parsed);
+    }
+}
+
+// ============================================================================
+// Flash storage address tests (no feature flag required)
+// ============================================================================
+
+#[cfg(feature = "nfc")]
+mod flash_address_tests {
+    use xiao_nrf52840_sword::pairing::{
+        FLASH_BONDED_DEVICE_SIZE, FLASH_BONDED_DEVICE_START, FLASH_RECORD_SIZE, MAX_BONDED_DEVICES,
+    };
+
+    #[test]
+    fn test_flash_start_is_page_aligned() {
+        assert_eq!(
+            FLASH_BONDED_DEVICE_START % 4096,
+            0,
+            "FLASH_BONDED_DEVICE_START must be 4 KB-page-aligned"
+        );
+    }
+
+    #[test]
+    fn test_flash_start_above_softdevice() {
+        // S140 ends at 0x00025FFF; application memory starts at 0x00026000.
+        assert!(
+            FLASH_BONDED_DEVICE_START >= 0x0002_6000,
+            "Flash storage must not overlap the S140 SoftDevice region"
+        );
+    }
+
+    #[test]
+    fn test_flash_end_within_nrf52840_flash() {
+        let end = FLASH_BONDED_DEVICE_START as u64 + FLASH_BONDED_DEVICE_SIZE as u64;
+        assert!(
+            end <= 0x0010_0000,
+            "Flash storage region must stay within nRF52840 1 MB flash"
+        );
+    }
+
+    #[test]
+    fn test_flash_at_expected_last_page() {
+        // We specifically target the last 4 KB page: 0x000E_F000
+        assert_eq!(FLASH_BONDED_DEVICE_START, 0x000E_F000);
+    }
+
+    #[test]
+    fn test_max_bonded_devices_page_fit() {
+        assert!(MAX_BONDED_DEVICES * FLASH_RECORD_SIZE <= FLASH_BONDED_DEVICE_SIZE);
+    }
+}
+
+// ============================================================================
+// BLE whitelist config tests
+// ============================================================================
+
+#[cfg(feature = "nfc")]
+mod ble_whitelist_tests {
+    use xiao_nrf52840_sword::pairing::BleConfig;
+
+    #[test]
+    fn test_open_config_no_whitelist_no_mac() {
+        let cfg = BleConfig::default();
+        assert!(!cfg.use_whitelist);
+        assert!(cfg.bonded_mac.is_none());
+    }
+
+    #[test]
+    fn test_bonded_only_enables_whitelist() {
+        let mac = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let cfg = BleConfig::bonded_only(mac);
+        assert!(cfg.use_whitelist);
+        assert_eq!(cfg.bonded_mac, Some(mac));
+    }
+
+    #[test]
+    fn test_bonded_only_mac_roundtrip() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let cfg = BleConfig::bonded_only(mac);
+        assert_eq!(cfg.bonded_mac.unwrap(), mac);
+    }
+
+    #[test]
+    fn test_different_macs_produce_distinct_configs() {
+        let mac_a = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let mac_b = [0x07u8, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+        let cfg_a = BleConfig::bonded_only(mac_a);
+        let cfg_b = BleConfig::bonded_only(mac_b);
+        assert_ne!(cfg_a, cfg_b);
+    }
+
+    #[test]
+    fn test_whitelist_config_differs_from_open() {
+        let open = BleConfig::default();
+        let wl = BleConfig::bonded_only([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        assert_ne!(open, wl);
+    }
+
+    #[test]
+    fn test_adv_interval_ms_default_is_100() {
+        // 160 units × 0.625 ms = 100 ms
+        assert_eq!(BleConfig::default().adv_interval_ms(), 100);
+    }
+
+    #[test]
+    fn test_adv_interval_ms_custom() {
+        let mut cfg = BleConfig::default();
+        // 32 units × 0.625 ms = 20 ms
+        cfg.adv_interval_units = 32;
+        assert_eq!(cfg.adv_interval_ms(), 20);
+    }
+}
+
+// ============================================================================
+// NFC UID state (host-side stub behaviour)
+// ============================================================================
+
+#[cfg(feature = "nfc")]
+mod nfc_state_tests {
+    use xiao_nrf52840_sword::nfc::{get_field_state, NfcFieldState};
+
+    /// On the host the ACTIVATED_UID static is never written, so
+    /// get_field_state() must always return Idle.
+    #[test]
+    fn test_host_field_state_is_idle() {
+        assert_eq!(get_field_state(), NfcFieldState::Idle);
+    }
+}
+
+// ============================================================================
+// pairing_mac characteristic value validation helpers
+// ============================================================================
+
+#[cfg(feature = "nfc")]
+mod pairing_mac_tests {
+    use xiao_nrf52840_sword::pairing::{make_flash_record, parse_flash_record};
+    use xiao_nrf52840_sword::BondedDevice;
+
+    /// Simulates what happens when the mobile app writes a real MAC via the
+    /// pairing_mac characteristic: we create a BondedDevice, write it to a
+    /// flash record, and read it back.
+    #[test]
+    fn test_real_mac_replaces_placeholder_in_flash_record() {
+        let placeholder = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+        let real_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        // Initial record uses placeholder MAC
+        let mut dev = BondedDevice::new(placeholder);
+        dev.set_paired(true);
+        let record_v1 = make_flash_record(&dev);
+        let parsed_v1 = parse_flash_record(&record_v1).unwrap();
+        assert_eq!(parsed_v1.mac, placeholder);
+
+        // App writes real MAC — we construct a new record
+        let mut dev2 = parsed_v1;
+        dev2.mac = real_mac;
+        let record_v2 = make_flash_record(&dev2);
+        let parsed_v2 = parse_flash_record(&record_v2).unwrap();
+        assert_eq!(parsed_v2.mac, real_mac);
+        // Flags preserved
+        assert!(parsed_v2.is_paired());
+        assert!(parsed_v2.is_active());
+    }
+
+    #[test]
+    fn test_pairing_mac_write_valid_6_byte_value() {
+        // A 6-byte MAC coming from the GATT write should produce a valid flash record
+        let mac: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        let mut dev = BondedDevice::new(mac);
+        dev.set_paired(true);
+        dev.set_verified(true);
+        let record = make_flash_record(&dev);
+        let parsed = parse_flash_record(&record).expect("valid record");
+        assert_eq!(parsed.mac, mac);
+        assert!(parsed.is_active());
+        assert!(parsed.is_paired());
+        assert!(parsed.is_verified());
     }
 }

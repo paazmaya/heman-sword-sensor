@@ -112,6 +112,7 @@ features = [
   "ble-gatt",
   "defmt",
   "critical-section-impl",
+  "macros",
 ]
 optional = true
 

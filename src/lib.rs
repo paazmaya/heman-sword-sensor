@@ -9,9 +9,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
-// Conditional imports for embedded features
-#[cfg(feature = "embedded")]
-use defmt::{info, warn};
+// defmt macros are used via fully-qualified paths (defmt::info!, defmt::warn!)
+// within the individual modules; no top-level import required.
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -301,10 +300,18 @@ pub mod nfc {
 
     /// Return the current NFC field state.
     ///
-    /// On the embedded target this is driven by the NFCT ISR; the
-    /// synchronous stub always returns `Idle` so it is safe to call
-    /// from host tests.
+    /// On the embedded target this tracks the last value stored by
+    /// [`store_activated_uid`].  On the host it always returns `Idle`.
     pub fn get_field_state() -> NfcFieldState {
+        #[cfg(feature = "embedded")]
+        {
+            if peek_activated_uid().is_some() {
+                NfcFieldState::Detected
+            } else {
+                NfcFieldState::Idle
+            }
+        }
+        #[cfg(not(feature = "embedded"))]
         NfcFieldState::Idle
     }
 
@@ -314,15 +321,14 @@ pub mod nfc {
 
     /// Validate a 10-byte NFC UID.
     ///
-    /// Nordic's NFCT peripheral initialises the first byte to `0x04`
-    /// (ISO/IEC 14443 cascade tag) for 10-byte UIDs.  A zero UID
-    /// (all bytes `0x00`) is treated as invalid.
+    /// Nordic's NFCT peripheral sets the first byte to `0x04`
+    /// (ISO/IEC 14443 cascade tag) for 7- and 10-byte UIDs.
+    /// An all-zero UID is treated as invalid (placeholder / error).
     pub fn is_valid_uid(uid: &[u8; 10]) -> bool {
-        // All-zeros is a placeholder / uninitialized value
         if uid.iter().all(|&b| b == 0) {
             return false;
         }
-        // First byte of a real 10-byte cascade UID is always 0x04
+        // First byte of a real cascade UID is always 0x04
         uid[0] == 0x04
     }
 
@@ -335,47 +341,26 @@ pub mod nfc {
     }
 
     // ------------------------------------------------------------------
-    // Async helpers — only compiled when the embassy runtime is present
+    // UID extraction helpers (pure logic — testable on host)
     // ------------------------------------------------------------------
 
-    /// Detect NFC field presence with a custom timeout.
+    /// Extract a canonical 10-byte UID from the raw byte slice returned
+    /// by the NFCT peripheral after `NfcT::activate()`.
     ///
-    /// The actual NFCT hardware activation is handled in `main.rs` via
-    /// `NfcT::activate()`.  This library-level function exists so the
-    /// higher-level pairing logic can call it without importing
-    /// `embassy-nrf` directly.
-    #[cfg(feature = "embedded")]
-    pub async fn detect_field_with_timeout(timeout_ms: u64) -> bool {
-        use embassy_time::Timer;
-
-        #[cfg(feature = "embedded")]
-        defmt::info!("📡 NFC field detection – timeout {} ms", timeout_ms);
-
-        // Hardware activation is performed via `NfcT::activate()` in
-        // main.rs.  This stub parks for one poll cycle so the pairing
-        // loop can keep iterating with its own deadline.
-        Timer::after_millis(100).await;
-        false
-    }
-
-    /// Detect NFC field with the default 500 ms poll timeout.
-    #[cfg(feature = "embedded")]
-    pub async fn detect_field() -> bool {
-        detect_field_with_timeout(500).await
-    }
-
-    /// Read the 10-byte UID from the NFC tag that was activated by
-    /// `NfcT::activate()` in `main.rs`.
+    /// The nRF52840 NFCT peripheral can return 4, 7, or 10 raw bytes
+    /// depending on the `NfcId` size configured:
     ///
-    /// `raw_uid` is the NfcId value passed through from the NFCT
-    /// peripheral after activation.  For `NfcId::SingleSize` the
-    /// hardware provides 4 bytes; we extend to 10 bytes for the return
-    /// type.  For a real tag the caller should supply the full UID
-    /// returned by the reader.
+    /// | `NfcId` size   | Raw bytes | Resulting UID                         |
+    /// |----------------|-----------|---------------------------------------|
+    /// | `SingleSize`   | 4         | Padded to 10 bytes (bytes 4–9 = 0x00) |
+    /// | `DoubleSize`   | 7         | Padded to 10 bytes (bytes 7–9 = 0x00) |
+    /// | `TripleSize`   | 10        | Used as-is                            |
     ///
-    /// Returns `None` when the UID is all-zero (placeholder / error).
-    #[cfg(feature = "embedded")]
+    /// Returns `None` when the raw slice is empty or all-zero.
     pub fn extract_uid_from_nfct(raw: &[u8]) -> Option<[u8; 10]> {
+        if raw.is_empty() {
+            return None;
+        }
         let mut uid = [0u8; 10];
         let copy_len = raw.len().min(10);
         uid[..copy_len].copy_from_slice(&raw[..copy_len]);
@@ -386,17 +371,133 @@ pub mod nfc {
         }
     }
 
+    /// Parse the raw UID bytes from a completed `NfcT::activate()` and
+    /// validate the result.
+    ///
+    /// This is a thin convenience wrapper around [`extract_uid_from_nfct`]
+    /// that additionally validates the extracted UID via [`is_valid_uid`]
+    /// (or [`is_valid_uid_7`] for 7-byte inputs).
+    ///
+    /// Returns `None` when the UID is missing, all-zero, or has an
+    /// unexpected first byte.
+    pub fn parse_nfct_uid(raw: &[u8]) -> Option<[u8; 10]> {
+        let uid = extract_uid_from_nfct(raw)?;
+
+        // For 7-byte source data, validate via the 7-byte helper
+        if raw.len() == 7 {
+            let mut short = [0u8; 7];
+            short.copy_from_slice(&raw[..7]);
+            if !is_valid_uid_7(&short) {
+                return None;
+            }
+        } else if !is_valid_uid(&uid) {
+            return None;
+        }
+
+        Some(uid)
+    }
+
+    // ------------------------------------------------------------------
+    // NFC UID shared state
+    //
+    // After `NfcT::activate()` completes in main.rs, the firmware calls
+    // `store_activated_uid()` so that the library-level pairing logic
+    // (pairing_mode(), authenticate_with_uid(), …) can access the real
+    // tag UID without receiving it as a function argument.
+    //
+    // On the host (desktop tests) the static is never written, so
+    // peek_activated_uid() always returns None which is fine.
+    // ------------------------------------------------------------------
+
+    /// Store the UID of the most-recently activated NFC tag.
+    ///
+    /// Call this from `main.rs` immediately after `NfcT::activate()`
+    /// succeeds, passing the raw bytes provided by the peripheral.
+    /// Internally calls [`parse_nfct_uid`] to validate and canonicalise
+    /// to 10 bytes before storing.
+    ///
+    /// Passing an empty or all-zero slice clears the stored UID.
+    #[cfg(feature = "embedded")]
+    pub fn store_activated_uid(raw: &[u8]) {
+        let uid = parse_nfct_uid(raw);
+        ACTIVATED_UID.lock(|cell| cell.set(uid));
+        match uid {
+            Some(u) => defmt::info!("🏷️  NFC UID stored: {:02x}", u),
+            None => defmt::warn!("⚠️  NFC UID invalid or empty – cleared"),
+        }
+    }
+
+    /// Return the UID stored by the most recent successful NFC activation,
+    /// or `None` if no valid tag has been activated since boot.
+    #[cfg(feature = "embedded")]
+    pub fn peek_activated_uid() -> Option<[u8; 10]> {
+        ACTIVATED_UID.lock(|cell| cell.get())
+    }
+
+    /// Clear the stored NFC UID (e.g. after pairing completes).
+    #[cfg(feature = "embedded")]
+    pub fn clear_activated_uid() {
+        ACTIVATED_UID.lock(|cell| cell.set(None));
+    }
+
+    // Safety: only accessed through the CriticalSectionMutex lock.
+    #[cfg(feature = "embedded")]
+    static ACTIVATED_UID: embassy_sync::blocking_mutex::Mutex<
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        core::cell::Cell<Option<[u8; 10]>>,
+    > = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(None));
+
+    // ------------------------------------------------------------------
+    // Async helpers — only compiled when the embassy runtime is present
+    // ------------------------------------------------------------------
+
+    /// Detect NFC field presence with a custom timeout.
+    ///
+    /// Polls [`peek_activated_uid`] every 100 ms.  The actual NFCT
+    /// hardware activation (`NfcT::activate()`) is initiated in
+    /// `main.rs`; once it completes the result is deposited via
+    /// [`store_activated_uid`] and this function returns `true`.
+    ///
+    /// Returns `false` when `timeout_ms` elapses without a UID being stored.
+    #[cfg(feature = "embedded")]
+    pub async fn detect_field_with_timeout(timeout_ms: u64) -> bool {
+        use embassy_time::{Duration, Instant, Timer};
+        defmt::info!("📡 NFC field detection – timeout {} ms", timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if peek_activated_uid().is_some() {
+                defmt::info!("✅ NFC field detected (UID present)");
+                return true;
+            }
+            if Instant::now() >= deadline {
+                defmt::info!("⏱️  NFC detect_field timeout");
+                return false;
+            }
+            Timer::after_millis(100).await;
+        }
+    }
+
+    /// Detect NFC field with the default 500 ms poll timeout.
+    #[cfg(feature = "embedded")]
+    pub async fn detect_field() -> bool {
+        detect_field_with_timeout(500).await
+    }
+
     /// Write 4 bytes to a Type 2 tag page (pages 4–19).
-    /// Stub — actual writes happen through the NFCT peripheral in main.rs.
+    ///
+    /// Type 2 tags are organised in 4-byte pages.  User memory starts at
+    /// page 4 (byte address 16) and extends to page 15 (bytes 60–63) on
+    /// a standard 64-byte MIFARE Ultralight tag.  Larger tags (e.g.
+    /// NTAG213/215/216) support pages up to 19 or beyond.
+    ///
+    /// The actual WRITE command is issued through the NFCT peripheral in
+    /// `main.rs`.  This function is a stub that logs the intent; replace
+    /// the body with the real NFCT WRITE path when required.
     #[cfg(feature = "embedded")]
     pub async fn write_nfc_page(page: u8, data: &[u8; 4]) -> bool {
-        #[cfg(feature = "embedded")]
-        {
-            defmt::info!("📡 Writing NFC page {}", page);
-            defmt::info!("   Data: {:?}", data);
-        }
-        #[cfg(not(feature = "embedded"))]
-        let _ = (page, data);
+        defmt::info!("📡 NFC WRITE page {} data {:02x}", page, data);
+        // TODO: issue ISO 14443-3A WRITE command via NfcT.
+        // For now we return true so callers can continue without blocking.
         true
     }
 }
@@ -419,8 +520,17 @@ pub mod pairing {
     // ------------------------------------------------------------------
 
     /// Start address of the bonded-device storage region in flash.
-    /// Must be 4 KB-page-aligned (0x2000 = 8192 = 2 × 4096).
-    pub const FLASH_BONDED_DEVICE_START: u32 = 0x0002_0000;
+    ///
+    /// Located at the last 4 KB page of the nRF52840's 1 MB flash:
+    ///   0x000EF000 = 1 MB – 4 KB = 0x000FF000 – 0x1000 (one page from the end)
+    ///
+    /// This is deliberately placed well above the S140 SoftDevice region
+    /// (0x00000000 – 0x00025FFF) and above typical application code, so
+    /// direct NVMC writes never corrupt the softdevice.
+    ///
+    /// Previously this was 0x0002_0000, which falls *inside* the S140 region
+    /// and would silently corrupt the BLE stack on first flash erase.
+    pub const FLASH_BONDED_DEVICE_START: u32 = 0x000E_F000;
     /// Size of the bonded-device storage region (4 KB = one flash page).
     pub const FLASH_BONDED_DEVICE_SIZE: usize = 4096;
     /// Maximum number of bonded devices that fit in one flash page.
@@ -619,7 +729,7 @@ pub mod pairing {
     pub fn read_bonded_device_full() -> Option<BondedDeviceFull> {
         #[cfg(feature = "embedded")]
         {
-            let addr = (FLASH_BONDED_DEVICE_START + FLASH_RECORD_SIZE as u32) as *const u8;
+            let addr = FLASH_BONDED_DEVICE_START as *const u8;
             let mut buf = [0u8; BondedDeviceFull::SERIALISED_SIZE];
             unsafe {
                 for (i, byte) in buf.iter_mut().enumerate() {
@@ -802,15 +912,24 @@ pub mod pairing {
 
     /// Run the full NFC pairing gate.
     ///
-    /// 1. Polls for an NFC field every 100 ms for up to
-    ///    [`NFC_PAIRING_TIMEOUT_SECS`] seconds.
-    /// 2. When a field is detected, reads the bonded device MAC from flash.
-    /// 3. Authenticates the MAC against the stored record.
-    /// 4. Returns `true` on success, `false` on timeout or auth failure.
+    /// 1. Waits up to [`NFC_PAIRING_TIMEOUT_SECS`] seconds for an NFC
+    ///    UID to appear in the shared [`nfc::ACTIVATED_UID`] static (which
+    ///    `main.rs` populates via [`nfc::store_activated_uid`] after a
+    ///    successful `NfcT::activate()` call).
+    /// 2. When a UID is detected:
+    ///    - **Re-pairing** (existing flash record): authenticates using both
+    ///      the stored MAC *and* the NFC UID via [`authenticate_with_uid`].
+    ///      Returns `true` on success.
+    ///    - **First-time pairing** (no flash record): a placeholder bonded
+    ///      device is registered with the UID so that a subsequent
+    ///      `authenticate_with_uid` call can verify the NFC tag.  The BLE
+    ///      MAC will be updated later by the mobile app via the writable
+    ///      `pairing_mac` GATT characteristic.  Returns `false` so `main.rs`
+    ///      knows it is still in open-advertising mode.
+    /// 3. Returns `false` on timeout.
     ///
-    /// The actual NFCT hardware activation (`NfcT::activate()`) is
-    /// performed in `main.rs`; this function drives the higher-level
-    /// pairing state machine.
+    /// The actual NFCT hardware activation (`NfcT::activate()`) must be
+    /// started concurrently in `main.rs` before calling this function.
     #[cfg(feature = "embedded")]
     pub async fn pairing_mode() -> bool {
         use embassy_time::{Duration, Instant, Timer};
@@ -824,27 +943,43 @@ pub mod pairing {
         let timeout = Duration::from_secs(NFC_PAIRING_TIMEOUT_SECS);
 
         loop {
-            if nfc::detect_field().await {
-                defmt::info!("✅ NFC field detected – initiating pairing…");
+            // Check whether main.rs has stored an activated UID
+            if let Some(uid) = nfc::peek_activated_uid() {
+                defmt::info!("✅ NFC UID present – initiating pairing…");
 
-                match read_bonded_device_mac() {
-                    Some(mac) => {
-                        if authenticate_bonded_device(&mac) {
+                match read_bonded_device_full() {
+                    Some(stored) => {
+                        // Re-pairing: validate with stored MAC + stored UID
+                        if authenticate_with_uid(&stored.dev.mac, &uid) {
+                            defmt::info!("✅ MAC + UID authentication successful");
+                            nfc::clear_activated_uid();
                             return true;
                         } else {
-                            defmt::warn!("⚠️  Bonded device authentication failed");
+                            defmt::warn!("❌ MAC + UID authentication failed");
+                            nfc::clear_activated_uid();
                             return false;
                         }
                     }
                     None => {
-                        defmt::warn!("⚠️  No bonded device in flash – open pairing mode");
-                        // First-time pairing: accept any NFC tap and register
+                        // First-time pairing: store the UID with a placeholder MAC.
+                        // The real MAC is written later via the pairing_mac
+                        // GATT characteristic once the mobile app connects.
+                        defmt::warn!(
+                            "⚠️  No bonded device in flash – registering NFC UID for first-time pairing"
+                        );
+                        let placeholder_mac = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+                        let mut dev = BondedDevice::new(placeholder_mac);
+                        dev.set_verified(true); // UID has been seen
+                        write_bonded_device_to_flash_full(&dev);
+                        // Clear so we don't re-trigger on the next loop
+                        nfc::clear_activated_uid();
+                        // Return false – open advertising, MAC still placeholder
                         return false;
                     }
                 }
             }
 
-            if start.elapsed() > timeout {
+            if start.elapsed() >= timeout {
                 defmt::info!("⏱️  NFC pairing timeout – falling back to BLE advertising");
                 return false;
             }

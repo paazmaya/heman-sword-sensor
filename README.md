@@ -29,27 +29,27 @@ A high-tech sword sensor with real-time motion tracking, NFC pairing security, a
 - `pairing::pairing_mode()` async gate: polls for NFC field, reads bonded MAC, authenticates, falls back to BLE on timeout
 - `BleConfig` struct with bonded MAC whitelist, advertising interval (units + ms helper), connection timeout, and `bonded_only()` constructor
 - **nrf-softdevice S140 BLE stack integrated**: `Softdevice::enable` with full `Config` (clock, GAP, GATT, GATTS attr table, device name)
-- **GATT server defined**: `SwordSensorService` with two characteristics — `sensor_data` (12-byte notify) and `pairing_status` (1-byte read/notify) — using custom 128-bit UUIDs
+- **GATT server defined**: `SwordSensorService` with three characteristics — `sensor_data` (12-byte read/notify), `pairing_status` (1-byte read/notify), and `pairing_mac` (6-byte write for first-time MAC registration) — using custom 128-bit UUIDs
 - **BLE advertising task** (`ble_task`): advertises as "He-Man Sword", accepts connections, supports whitelist mode when a bonded device is present
 - **BLE sensor streaming task** (`stream_sensor_data_ble`): drains `SENSOR_CHANNEL` and sends notify updates to the connected central at 20 Hz
 - **Softdevice task** (`softdevice_task`): drives the S140 event loop on a dedicated embassy task
 - First-time pairing flow: NFC tap on a device with no stored record registers a new `BondedDevice` in NVMC flash
 - `nfc` Cargo feature: compiles `nfc` and `pairing` modules on the host target with no embedded hardware required
 - `memory.x` updated for S140: FLASH at `0x00026000` (after 152 KB softdevice), RAM at `0x20002000`
-- Desktop tests: **91 tests** — 34 base + 57 NFC-gated (run with `cargo test --features nfc`)
-  - New tests: `SensorData` serialisation round-trip, NFC UID validation, flash record magic/round-trip/inactive-slot, `BleConfig` default/whitelist/interval, `BondedDeviceFull` round-trip and UID offset, `authenticate_with_uid`, `MAX_BONDED_DEVICES` page-fit, `BondedDevice` flag clear, `FLASH_RECORD_SIZE` constant, motion classification priority
-
-### In Progress
-
-- Full NFC Type 2 tag UID read from the activated tag: `extract_uid_from_nfct` uses the programmed `NfcId` bytes; a real ISO 14443-4 NDEF read path would retrieve the UID directly from the reader after `activate()` completes
+- NFC UID shared-state pipeline: `parse_nfct_uid()` validates cascade-byte + extracts UID; `store_activated_uid()` / `peek_activated_uid()` / `clear_activated_uid()` manage a `CriticalSectionMutex`-wrapped shared static written from `main.rs` after `NfcT::activate()` and consumed by `pairing::pairing_mode()`
+- `nvmc_read_bonded_device_full()` reads the 22-byte primary-record + NFC-UID region atomically via NVMC
+- **Writable `pairing_mac` GATT characteristic (UUID `…0005`)**: the mobile app writes its real 6-byte BLE MAC here; `ble_task` forwards the value through `MAC_UPDATE_CHANNEL`, and the main loop consumes it and persists to flash via `nvmc_write_bonded_device_full` / `nvmc_write_bonded_device`, preserving the existing UID, flags, and timestamp
+- Desktop tests: **122 tests** — 34 base + 88 NFC-gated (run with `cargo test --features nfc`)
+  - Includes: `SensorData` serialisation round-trip, NFC UID validation, `extract_uid_from_nfct` / `parse_nfct_uid` extraction and cascade validation, flash record magic/round-trip/inactive-slot, `BleConfig` default/whitelist/interval, `BondedDeviceFull` round-trip and UID offset, `authenticate_with_uid`, `MAX_BONDED_DEVICES` page-fit, `BondedDevice` flag clear, `FLASH_RECORD_SIZE` constant, motion classification priority, placeholder-to-real MAC flash record replacement, `pairing_mac` value validation
 
 ### TODO
 
-- Replace placeholder MAC in first-time pairing with a real mobile-app-provided MAC (written via NDEF or a writable GATT characteristic)
-- LED animation engine (WS2812B via PWM on P0.11)
-- Mobile app for pairing, visualization, and real-time LED control
+- LED animation engine (WS2812B via PWM on P0.11) — `animate_led_thrust()` is currently a logging stub
+- Mobile app for pairing, visualization, and real-time LED control (mobile app writes its MAC to the `pairing_mac` GATT characteristic, which is already wired on the firmware side)
 - Sensor fusion algorithms such as Madgwick AHRS
 - Flash the nRF-Softdevice S140 hex once before first use (see flashing instructions below)
+- After a runtime `pairing_mac` write, the new whitelist takes effect on the next reboot; `ble_task` does not currently hot-reload the whitelist mid-session
+- Production builds should migrate NVMC flash writes to the SoftDevice flash API (`sd_flash_write` / `sd_flash_page_erase`) instead of `embassy_nrf::nvmc::Nvmc` (see Flash Storage Layout note below)
 
 ## 1. Hardware: XIAO nRF52840 Sense + LSM6DS3TR IMU
 
@@ -223,15 +223,15 @@ The implementation uses embassy-nrf's NFCT peripheral (`NfcT::new` + `nfct.activ
 
 #### Flash Storage Layout
 
-Bonded device data is stored starting at `0x0002_0000` (128 KB offset, 4 KB page-aligned, well above application code and softdevice).
+Bonded device data is stored starting at `0x000E_F000` (the last 4 KB page of the 1 MB flash, page-aligned and outside the application and SoftDevice regions).
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
 │ nRF52840 flash address map (with S140 softdevice)            │
 ├──────────────────────────────────────────────────────────────┤
 │ 0x00000000 - 0x00025FFF │ S140 SoftDevice (152 KB)           │
-│ 0x00026000 - 0x0001FFFF │ Application code (starts here)     │
-│ 0x00020000 - 0x00020FFF │ Bonded device storage (4 KB page)  │
+│ 0x00026000 - 0x000EDFFF │ Application code (starts here)     │
+│ 0x000EF000 - 0x000EFFFF │ Bonded device storage (4 KB page)  │
 │                         │   Record format (12 bytes each):   │
 │                         │   - 1 byte  magic (0xAB)           │
 │                         │   - 6 bytes MAC address            │
@@ -277,42 +277,46 @@ enum NfcPairingStatus {
 
 Top-level crate functions (available with `nfc` or `embedded` feature):
 
-| Function                       | Description                               | Returns            |
-| ------------------------------ | ----------------------------------------- | ------------------ |
-| `authenticate_bonded_device()` | Verify bonded MAC (active + paired check) | `bool`             |
-| `get_nfc_pairing_status()`     | Get current pairing status                | `NfcPairingStatus` |
+| Function                       | Description                                             | Returns            |
+| ------------------------------ | ------------------------------------------------------- | ------------------ |
+| `authenticate_bonded_device()` | Verify bonded MAC (active + paired check)               | `bool`             |
+| `get_nfc_pairing_status()`     | Return current pairing status (currently always `Idle`) | `NfcPairingStatus` |
 
 `nfc` module (sync helpers available with `nfc` or `embedded`; async and embedded-only functions require `embedded`):
 
-| Function                           | Description                                       | Returns            |
-| ---------------------------------- | ------------------------------------------------- | ------------------ |
-| `nfc::get_field_state()`           | Current field state                               | `NfcFieldState`    |
-| `nfc::is_valid_uid()`              | Validate 10-byte NFC UID (cascade tag byte check) | `bool`             |
-| `nfc::is_valid_uid_7()`            | Validate 7-byte NFC UID                           | `bool`             |
-| `nfc::extract_uid_from_nfct()`     | Extract UID from raw NFCT bytes — `embedded` only | `Option<[u8; 10]>` |
-| `nfc::detect_field()`              | Detect NFC field (500 ms default) — async         | `bool`             |
-| `nfc::detect_field_with_timeout()` | Detect NFC field with custom timeout — async      | `bool`             |
-| `nfc::write_nfc_page()`            | Write 4-byte Type 2 tag page — async stub         | `bool`             |
+| Function                           | Description                                                                    | Returns            |
+| ---------------------------------- | ------------------------------------------------------------------------------ | ------------------ |
+| `nfc::get_field_state()`           | Current field state (based on presence of stored activated UID)                | `NfcFieldState`    |
+| `nfc::is_valid_uid()`              | Validate 10-byte NFC UID (cascade tag byte 0x04 check, all-zero reject)        | `bool`             |
+| `nfc::is_valid_uid_7()`            | Validate 7-byte NFC UID                                                        | `bool`             |
+| `nfc::extract_uid_from_nfct()`     | Extract 10-byte canonical UID from raw NFCT bytes (4/7/10-byte inputs)         | `Option<[u8; 10]>` |
+| `nfc::parse_nfct_uid()`            | Extract + validate cascade-byte; thin wrapper used after `activate()`          | `Option<[u8; 10]>` |
+| `nfc::store_activated_uid()`       | Deposit raw bytes from `NfcT::activate()` into shared static — `embedded` only | (void)             |
+| `nfc::peek_activated_uid()`        | Read the last stored activated UID from shared static — `embedded` only        | `Option<[u8; 10]>` |
+| `nfc::clear_activated_uid()`       | Clear the shared activated UID (after pairing completes) — `embedded`          | (void)             |
+| `nfc::detect_field()`              | Detect NFC field (500 ms default) — async, polls `peek_activated_uid()`        | `bool`             |
+| `nfc::detect_field_with_timeout()` | Detect NFC field with custom timeout — async                                   | `bool`             |
+| `nfc::write_nfc_page()`            | Reserved Type 2 tag page-write API; currently logs and returns success         | `bool`             |
 
 `pairing` module (sync helpers available with `nfc` or `embedded`; async requires `embedded`):
 
-| Function                                       | Description                                        | Returns                    |
-| ---------------------------------------------- | -------------------------------------------------- | -------------------------- |
-| `pairing::read_bonded_device_mac()`            | Read MAC from flash (NVMC on target, stub on host) | `Option<[u8; 6]>`          |
-| `pairing::read_bonded_device()`                | Read `BondedDevice` from flash                     | `Option<BondedDevice>`     |
-| `pairing::read_bonded_device_full()`           | Read `BondedDeviceFull` (MAC + UID) from flash     | `Option<BondedDeviceFull>` |
-| `pairing::authenticate_bonded_device()`        | Verify MAC against stored record                   | `bool`                     |
-| `pairing::authenticate_with_uid()`             | Verify MAC + NFC UID against stored record         | `bool`                     |
-| `pairing::get_nfc_pairing_status()`            | Current pairing status                             | `NfcPairingStatus`         |
-| `pairing::write_bonded_device_to_flash()`      | Write MAC to flash (delegates to NVMC in main.rs)  | `bool`                     |
-| `pairing::write_bonded_device_to_flash_full()` | Write full struct to flash                         | `bool`                     |
-| `pairing::make_flash_record()`                 | Serialise device to 12-byte flash record           | `[u8; 12]`                 |
-| `pairing::parse_flash_record()`                | Deserialise and validate a flash record            | `Option<BondedDevice>`     |
-| `pairing::register_bonded_device()`            | Register new device                                | `bool`                     |
-| `pairing::unregister_bonded_device()`          | Remove device                                      | `bool`                     |
-| `pairing::get_bonded_devices()`                | Get all bonded devices                             | `[BondedDevice; 2]`        |
-| `pairing::is_bonded_device()`                  | Check if MAC is bonded (active records only)       | `bool`                     |
-| `pairing::pairing_mode()`                      | Full async pairing gate — async, `embedded` only   | `bool`                     |
+| Function                                       | Description                                                                                | Returns                    |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------ | -------------------------- |
+| `pairing::read_bonded_device_mac()`            | Read MAC from flash (NVMC on target, stub on host)                                         | `Option<[u8; 6]>`          |
+| `pairing::read_bonded_device()`                | Read `BondedDevice` from flash                                                             | `Option<BondedDevice>`     |
+| `pairing::read_bonded_device_full()`           | Read `BondedDeviceFull` (MAC + UID) from flash                                             | `Option<BondedDeviceFull>` |
+| `pairing::authenticate_bonded_device()`        | Verify MAC against stored record                                                           | `bool`                     |
+| `pairing::authenticate_with_uid()`             | Verify MAC + NFC UID against stored record                                                 | `bool`                     |
+| `pairing::get_nfc_pairing_status()`            | Current pairing status; state tracking is not wired yet                                    | `NfcPairingStatus`         |
+| `pairing::write_bonded_device_to_flash()`      | Write MAC to flash (delegates to NVMC in main.rs)                                          | `bool`                     |
+| `pairing::write_bonded_device_to_flash_full()` | Write full struct to flash                                                                 | `bool`                     |
+| `pairing::make_flash_record()`                 | Serialise device to 12-byte flash record                                                   | `[u8; 12]`                 |
+| `pairing::parse_flash_record()`                | Deserialise and validate a flash record                                                    | `Option<BondedDevice>`     |
+| `pairing::register_bonded_device()`            | Register new device                                                                        | `bool`                     |
+| `pairing::unregister_bonded_device()`          | Remove device                                                                              | `bool`                     |
+| `pairing::get_bonded_devices()`                | Get all bonded devices                                                                     | `[BondedDevice; 2]`        |
+| `pairing::is_bonded_device()`                  | Check if MAC is bonded (active records only)                                               | `bool`                     |
+| `pairing::pairing_mode()`                      | Reusable async pairing helper; boot currently uses the equivalent inline gate in `main.rs` | `bool`                     |
 
 `pairing::BleConfig`:
 
@@ -325,10 +329,11 @@ Top-level crate functions (available with `nfc` or `embedded` feature):
 
 GATT server (`SwordSensorService`, UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`):
 
-| Characteristic   | UUID suffix | Properties    | Format                                                              |
-| ---------------- | ----------- | ------------- | ------------------------------------------------------------------- |
-| `sensor_data`    | `…0003`     | Read + Notify | 12 bytes, i16 LE × 6 (accel XYZ, gyro XYZ)                          |
-| `pairing_status` | `…0004`     | Read + Notify | 1 byte (0=Idle, 1=Scanning, 2=Auth, 3=Success, 4=Failed, 5=Timeout) |
+| Characteristic   | UUID suffix | Properties    | Format                                                                                                                                      |
+| ---------------- | ----------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sensor_data`    | `…0003`     | Read + Notify | 12 bytes, i16 LE × 6 (accel XYZ, gyro XYZ)                                                                                                  |
+| `pairing_status` | `…0004`     | Read + Notify | 1 byte (0=Idle, 1=Scanning, 2=Auth, 3=Success, 4=Failed, 5=Timeout)                                                                         |
+| `pairing_mac`    | `…0005`     | Write         | 6-byte BLE MAC written by the mobile app to replace the first-time placeholder; forwarded via `MAC_UPDATE_CHANNEL` → main loop → NVMC flash |
 
 #### Security Considerations
 
@@ -351,7 +356,7 @@ cargo build --release --features embedded --target thumbv7em-none-eabihf
 # Run desktop tests (34 tests, no feature flag needed)
 cargo test --test integration_test
 
-# Run desktop tests including all NFC/pairing/BLE tests (91 tests)
+# Run desktop tests including all NFC/pairing/BLE tests (122 tests)
 cargo test --test integration_test --features nfc
 
 # Run on hardware (requires S140 softdevice pre-flashed; see Flashing below)
@@ -425,18 +430,25 @@ struct SwordSensorService {
 
     #[characteristic(uuid = "6e400004-…", read, notify)]
     pairing_status: u8,        // NfcPairingStatus numeric value
+
+    #[characteristic(uuid = "6e400005-…", write)]
+    pairing_mac: [u8; 6],      // mobile app writes its real BLE MAC here
+                               // to replace the first-time placeholder;
+                               // main loop drains MAC_UPDATE_CHANNEL and
+                               // persists via nvmc_write_bonded_device_full
 }
 ```
 
-**What remains:**
+**Implementation notes / production gaps:**
 
-- NFC UID is provisioned from the `NfcId` bytes; a real read after `activate()` requires the ISO 14443-4 APDU read path
-- First-time pairing stores a placeholder MAC; the mobile app should provide its real MAC via NDEF or a writable characteristic
-- Flash writes go through the NVMC driver directly; production builds should use `sd_flash_write` when S140 is loaded
+- The nRF52840 NFCT peripheral operates in **Type 2 Tag** mode; the configured `NfcId` bytes are the tag's own UID presented to an external reader. After `NfcT::activate()` the raw identifier is run through `parse_nfct_uid()` and stored via `store_activated_uid()`; existing bonded devices must match both the stored MAC and UID before whitelist advertising starts.
+- First-time pairing writes a placeholder MAC (`[0xDE,0xAD,0xBE,0xEF,0x00,0x01]`) to flash; the mobile app **must** write its real BLE MAC to the `pairing_mac` GATT characteristic (`…0005`) during its first connection. The firmware's main loop drains `MAC_UPDATE_CHANNEL` and persists the new MAC via `nvmc_write_bonded_device_full`, preserving the NFC UID, flags, and timestamp.
+- After a runtime `pairing_mac` write, the whitelist takes effect on the **next reboot**; `ble_task` does not currently hot-reload the whitelist or re-advertise mid-session.
+- Flash writes go through the NVMC driver directly; production builds should use `sd_flash_write` when S140 is loaded. The current storage address is `0x000E_F000`, not inside the SoftDevice region.
 
 #### Future Enhancements
 
-- Replace placeholder MAC in first-time pairing with NDEF-provided or app-written MAC
+- Hot-reload the BLE whitelist after a `pairing_mac` GATT write (re-advertise with new bonded MAC without reboot)
 - LED animation engine (WS2812B via PWM on P0.11)
 - Madgwick AHRS sensor fusion
 - Multiple bonded devices across flash pages
@@ -504,30 +516,37 @@ async fn main_sensor_loop(imu: &mut LSM6DS3TR<I2cInterface<Twim>>) {
 
 ### Refactored Core Functions
 
-| Function                                | Purpose                                                | Status                               |
-| --------------------------------------- | ------------------------------------------------------ | ------------------------------------ |
-| `init_i2c()`                            | Configure TWIM0 I2C pins and frequency                 | Implemented                          |
-| `init_imu()`                            | Initialize LSM6DS3TR sensor                            | Implemented                          |
-| `read_sensor_data()`                    | Single IMU read for accelerometer and gyroscope        | Implemented                          |
-| `detect_nfc_field()`                    | Wait for NFC field via `NfcT::activate()` with timeout | Implemented in `main.rs`             |
-| `nvmc_write_bonded_device()`            | Erase flash page and write bonded device record        | Implemented in `main.rs`             |
-| `nvmc_read_bonded_device()`             | Read bonded device record from flash via NVMC          | Implemented in `main.rs`             |
-| `pairing::pairing_mode()`               | Full async NFC pairing gate with BLE fallback          | Implemented (async, `embedded` only) |
-| `pairing::authenticate_bonded_device()` | MAC + active/paired flag check                         | Implemented and tested               |
-| `pairing::authenticate_with_uid()`      | MAC + NFC UID dual-factor check                        | Implemented and tested               |
-| `sensor_loop()`                         | Read IMU at 20 Hz, detect thrust, send to BLE channel  | Implemented                          |
-| `stream_sensor_data_ble()`              | Drain SENSOR_CHANNEL and send BLE notifications        | Implemented                          |
-| `ble_task()`                            | Embassy task: advertise → connect → stream sensor data | Implemented                          |
-| `softdevice_task()`                     | Embassy task: drive nrf-softdevice S140 event loop     | Implemented                          |
-| `detect_upward_thrust()`                | Motion threshold detection on Z-axis                   | Implemented and tested               |
-| `classify_motion()`                     | Classify idle, moderate, intense, or upward thrust     | Implemented and tested               |
-| `validate_sensor_data()`                | Range-check IMU readings                               | Implemented and tested               |
+| Function                                                                        | Purpose                                                                                        | Status                                               |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `init_i2c()`                                                                    | Configure TWIM0 I2C pins and frequency                                                         | Implemented                                          |
+| `init_imu()`                                                                    | Initialize LSM6DS3TR sensor                                                                    | Implemented                                          |
+| `read_sensor_data()`                                                            | Single IMU read for accelerometer and gyroscope                                                | Implemented                                          |
+| `detect_nfc_field()`                                                            | Wait for NFC field via `NfcT::activate()` with timeout                                         | Implemented in `main.rs`                             |
+| `nfc::parse_nfct_uid()`                                                         | Extract + validate cascade-byte UID after `NfcT::activate()`                                   | Implemented and tested (host)                        |
+| `nfc::store_activated_uid()` / `peek_activated_uid()` / `clear_activated_uid()` | Shared UID static via `CriticalSectionMutex` — written in boot gate, read in `pairing_mode()`  | Implemented (`embedded` only)                        |
+| `nvmc_write_bonded_device()`                                                    | Erase flash page and write 12-byte bonded device record                                        | Implemented in `main.rs`                             |
+| `nvmc_write_bonded_device_full()`                                               | Write primary record + 10-byte NFC UID atomically (single erase+write)                         | Implemented in `main.rs`                             |
+| `nvmc_read_bonded_device()`                                                     | Read bonded device record from flash via NVMC                                                  | Implemented in `main.rs`                             |
+| `nvmc_read_bonded_device_full()`                                                | Read 22-byte primary + UID region atomically via NVMC                                          | Implemented in `main.rs`                             |
+| `MAC_UPDATE_CHANNEL` drain (main loop)                                          | Receive `pairing_mac` GATT writes → update bonded MAC in flash (preserves UID/flags/timestamp) | Implemented in `main.rs`                             |
+| `pairing::pairing_mode()`                                                       | Reusable NFC pairing helper with BLE fallback                                                  | Implemented, but not called by the current boot path |
+| `pairing::authenticate_bonded_device()`                                         | MAC + active/paired flag check                                                                 | Implemented and tested                               |
+| `pairing::authenticate_with_uid()`                                              | MAC + NFC UID dual-factor check                                                                | Implemented and tested                               |
+| Main loop (inlined)                                                             | Read IMU at 20 Hz + drain MAC update channel + feed `SENSOR_CHANNEL`                           | Implemented (replaces standalone `sensor_loop`)      |
+| `stream_sensor_data_ble()`                                                      | Drain SENSOR_CHANNEL and send BLE notifications                                                | Implemented                                          |
+| `ble_task()`                                                                    | Embassy task: advertise → connect → stream → accept `pairing_mac` write                        | Implemented                                          |
+| `softdevice_task()`                                                             | Embassy task: drive nrf-softdevice S140 event loop                                             | Implemented                                          |
+| `detect_upward_thrust()`                                                        | Motion threshold detection on Z-axis                                                           | Implemented and tested                               |
+| `classify_motion()`                                                             | Classify idle, moderate, intense, or upward thrust                                             | Implemented and tested                               |
+| `validate_sensor_data()`                                                        | Range-check IMU readings                                                                       | Implemented and tested                               |
 
-Stub functions pending full implementation:
+Remaining firmware gaps:
 
-| Function               | Purpose               | Next Step                                |
-| ---------------------- | --------------------- | ---------------------------------------- |
-| `animate_led_thrust()` | WS2812B LED animation | Implement PWM via `embassy-nrf` on P0.11 |
+| Function                   | Purpose                            | Next Step                                           |
+| -------------------------- | ---------------------------------- | --------------------------------------------------- |
+| `animate_led_thrust()`     | WS2812B LED animation              | Implement PWM via `embassy-nrf` on P0.11            |
+| `nfc::write_nfc_page()`    | ISO 14443-3A Type 2 tag page write | Wire through a real NFCT WRITE command in `main.rs` |
+| `get_nfc_pairing_status()` | Live pairing status reporting      | Store and update state instead of returning `Idle`  |
 
 ### Unit Tests
 
@@ -547,7 +566,7 @@ Desktop tests verify core logic without hardware:
 - Flash storage constants and page-fit assertion for `MAX_BONDED_DEVICES`
 - `authenticate_bonded_device` with matching and mismatched MACs
 - `authenticate_with_uid` with correct and wrong MAC/UID combinations
-- All pairing CRUD helpers and their stub return values
+- Pairing CRUD helper contracts, including host-side simulated flash results
 - `get_bonded_devices` and `is_bonded_device` lookups
 - `BleConfig` default values, interval calculation, `bonded_only()` whitelist constructor
 
@@ -563,7 +582,15 @@ Run with NFC types included:
 cargo test --test integration_test --features nfc
 ```
 
-The base run covers **34 tests**. Adding `--features nfc` runs **91 tests** (34 base + 57 NFC/pairing/BLE). Both run on the host target with no target specification required.
+The base run covers **34 tests**. Adding `--features nfc` runs **122 tests** (34 base + 88 NFC/pairing/BLE/MAC-update). Both run on the host target with no target specification required.
+
+Additional NFC-gated test modules added since last update:
+
+- `nfc_uid_tests` — `extract_uid_from_nfct` / `parse_nfct_uid` for 4/7/10-byte inputs, cascade-byte validation
+- `flash_address_tests` — page-alignment, softdevice-boundary, and 1-MB flash-boundary assertions for storage constants
+- `ble_whitelist_tests` — `BleConfig` custom interval, distinctness for different MACs
+- `nfc_state_tests` — host-side `get_field_state()` stub behaviour
+- `pairing_mac_tests` — placeholder→real MAC flash record replacement, 6-byte `pairing_mac` value record generation
 
 ### LED Animation: Motion-Triggered Flash
 

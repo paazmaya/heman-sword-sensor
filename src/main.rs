@@ -41,7 +41,7 @@ use lsm6ds3tr::LSM6DS3TR;
 use nrf_softdevice::ble::advertisement_builder::{
     Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
 };
-use nrf_softdevice::ble::{gatt_server, peripheral, Connection};
+use nrf_softdevice::ble::{gatt_server, peripheral, Address, AddressType, Connection};
 use nrf_softdevice::{raw, Softdevice};
 use panic_probe as _;
 use static_cell::{ConstStaticCell, StaticCell};
@@ -49,10 +49,9 @@ use static_cell::{ConstStaticCell, StaticCell};
 // Lib re-exports
 use xiao_nrf52840_sword::{
     detect_upward_thrust,
-    nfc::extract_uid_from_nfct,
+    nfc::{parse_nfct_uid, store_activated_uid},
     pairing::{
-        make_flash_record, parse_flash_record, read_bonded_device, register_bonded_device,
-        BleConfig, BondedDeviceFull, FLASH_BONDED_DEVICE_START, FLASH_RECORD_SIZE,
+        make_flash_record, parse_flash_record, FLASH_BONDED_DEVICE_START, FLASH_RECORD_SIZE,
     },
     BondedDevice, NFC_PAIRING_TIMEOUT_SECS, SENSOR_SAMPLING_INTERVAL_MS,
 };
@@ -129,9 +128,11 @@ static SENSOR_CHANNEL: Channel<CriticalSectionRawMutex, SensorData, 16> = Channe
 
 /// GATT service for He-Man Sword Sensor.
 ///
-/// Exposes two characteristics:
+/// Exposes three characteristics:
 /// - `sensor_data` (notify): 12-byte packed accel+gyro at 20 Hz
-/// - `pairing_status` (read): 1-byte pairing status code
+/// - `pairing_status` (read/notify): 1-byte pairing status code
+/// - `pairing_mac` (write): mobile app writes its real 6-byte BLE MAC here
+///   during first-time pairing to replace the placeholder stored in flash
 #[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
 struct SwordSensorService {
     /// 12-byte sensor data (accel XYZ + gyro XYZ, i16 LE each), notify only.
@@ -141,6 +142,15 @@ struct SwordSensorService {
     /// 1-byte pairing status code (0=Idle, 1=Scanning, 2=Auth, 3=Success, 4=Failed, 5=Timeout).
     #[characteristic(uuid = "6e400004-b5a3-f393-e0a9-e50e24dcca9e", read, notify)]
     pairing_status: u8,
+
+    /// 6-byte BLE MAC written by the mobile app during first-time pairing.
+    ///
+    /// When a central writes a valid 6-byte value here, the firmware
+    /// updates the bonded device record in NVMC flash to replace the
+    /// placeholder MAC.  Subsequent connections will use whitelist
+    /// advertising targeting this real MAC.
+    #[characteristic(uuid = "6e400005-b5a3-f393-e0a9-e50e24dcca9e", write)]
+    pairing_mac: [u8; 6],
 }
 
 /// Top-level GATT server.
@@ -150,11 +160,10 @@ struct Server {
 }
 
 // ============================================================================
-// STATIC CELLS FOR SERVER AND SOFTDEVICE
+// STATIC CELL FOR GATT SERVER
 // ============================================================================
 
 static SERVER: StaticCell<Server> = StaticCell::new();
-static SD: StaticCell<Softdevice> = StaticCell::new();
 
 // ============================================================================
 // EMBASSY TASKS
@@ -166,11 +175,19 @@ async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
+// Channel for the mobile app to update the bonded MAC from ble_task → main.
+// Capacity 1 is enough: only one MAC update is expected per pairing session.
+static MAC_UPDATE_CHANNEL: Channel<CriticalSectionRawMutex, [u8; 6], 1> = Channel::new();
+
 /// BLE peripheral task: advertise → accept connection → stream sensor data.
 ///
-/// When `bonded_mac` is `Some`, the advertising payload targets that
-/// device with a directed/whitelist advertisement.  When `None`, an
-/// open undirected advertisement is used (first-time pairing or fallback).
+/// When `bonded_mac` is `Some`, advertising uses a whitelist so only the
+/// paired central can connect.  When `None`, open undirected advertising is
+/// used (first-time pairing / fallback mode).
+///
+/// If the connected central writes to the `pairing_mac` characteristic, the
+/// new MAC is forwarded via [`MAC_UPDATE_CHANNEL`] so the caller can persist
+/// it to NVMC flash and restart advertising with whitelist mode.
 #[embassy_executor::task]
 async fn ble_task(sd: &'static Softdevice, server: &'static Server, bonded_mac: Option<[u8; 6]>) {
     // Build advertising payload
@@ -195,17 +212,28 @@ async fn ble_task(sd: &'static Softdevice, server: &'static Server, bonded_mac: 
     }
 
     loop {
-        let config = peripheral::Config::default();
+        let mut config = peripheral::Config::default();
 
-        // Advertise until a central connects
+        // When we have a bonded MAC, reduce the advertising interval to
+        // 20 ms (32 units × 0.625 ms) for faster reconnect.  Open
+        // advertising uses the default 100 ms interval.
+        if bonded_mac.is_some() {
+            config.interval = 32; // 32 × 0.625 ms = 20 ms
+        }
+
+        // Advertise until a central connects.
+        // With a bonded MAC we use a whitelist so only the paired device
+        // can connect.  Without one we use open undirected advertising.
         let conn: Connection = match bonded_mac {
-            Some(_mac) => {
-                // Use whitelist advertising when we have a bonded device.
-                // ConnectableAdvertisement::ScannableUndirected with a
-                // whitelist is set by configuring the softdevice GAP whitelist
-                // before calling advertise_connectable.
-                // For simplicity we use undirected advertising here; the
-                // whitelist can be enforced via the security manager on bond.
+            Some(mac) => {
+                // Set the GAP whitelist to the bonded MAC before advertising.
+                let addr = Address::new(AddressType::RandomStatic, mac);
+                if let Err(e) = nrf_softdevice::ble::set_whitelist(sd, &[addr]) {
+                    warn!("Failed to set BLE whitelist: {:?}", e);
+                }
+                // FilterPolicy::Both restricts both scan and connection requests
+                // to the whitelist, so only the paired central can connect.
+                config.filter_policy = peripheral::FilterPolicy::Both;
                 let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
                     adv_data: &ADV_DATA,
                     scan_data: &SCAN_DATA,
@@ -213,13 +241,16 @@ async fn ble_task(sd: &'static Softdevice, server: &'static Server, bonded_mac: 
                 match peripheral::advertise_connectable(sd, adv, &config).await {
                     Ok(c) => c,
                     Err(e) => {
-                        warn!("BLE advertise error: {:?}", e);
+                        warn!("BLE advertise error (whitelist): {:?}", e);
                         Timer::after_millis(500).await;
                         continue;
                     }
                 }
             }
             None => {
+                // Clear any previously set whitelist so open advertising works.
+                let _ = nrf_softdevice::ble::set_whitelist(sd, &[]);
+                config.filter_policy = peripheral::FilterPolicy::Any;
                 let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
                     adv_data: &ADV_DATA,
                     scan_data: &SCAN_DATA,
@@ -227,7 +258,7 @@ async fn ble_task(sd: &'static Softdevice, server: &'static Server, bonded_mac: 
                 match peripheral::advertise_connectable(sd, adv, &config).await {
                     Ok(c) => c,
                     Err(e) => {
-                        warn!("BLE advertise error: {:?}", e);
+                        warn!("BLE advertise error (open): {:?}", e);
                         Timer::after_millis(500).await;
                         continue;
                     }
@@ -237,8 +268,8 @@ async fn ble_task(sd: &'static Softdevice, server: &'static Server, bonded_mac: 
 
         info!("✅ BLE central connected");
 
-        // Update pairing_status characteristic to reflect connection
-        let _ = server.swd.pairing_status_set(&3u8); // 3 = Success
+        // Update pairing_status to Success (3)
+        let _ = server.swd.pairing_status_set(&3u8);
 
         // Run GATT server and sensor streaming concurrently until disconnect
         let sensor_fut = stream_sensor_data_ble(server, &conn);
@@ -250,9 +281,14 @@ async fn ble_task(sd: &'static Softdevice, server: &'static Server, bonded_mac: 
                 SwordSensorServiceEvent::PairingStatusCccdWrite { notifications } => {
                     info!("pairing_status notifications: {}", notifications);
                 }
+                SwordSensorServiceEvent::PairingMacWrite(value) => {
+                    info!("📲 pairing_mac written by central: {:?}", value);
+                    if MAC_UPDATE_CHANNEL.try_send(value).is_err() {
+                        warn!("MAC_UPDATE_CHANNEL full – MAC update dropped");
+                    }
+                }
             },
         });
-
         embassy_futures::select::select(sensor_fut, gatt_fut).await;
 
         info!("🔌 BLE central disconnected – restarting advertising");
@@ -331,7 +367,6 @@ fn read_sensor_data(imu: &mut LSM6DS3TR<I2cInterface<Twim<'static>>>) -> Option<
 // ============================================================================
 
 /// Signal a thrust on the LED strip.
-/// TODO: Implement via PWM + WS2812B protocol on P0.11.
 fn animate_led_thrust(_duration_ms: u32) {
     info!("💡 LED thrust animation (stub)");
 }
@@ -383,13 +418,12 @@ fn nvmc_write_bonded_device(nvmc: &mut Nvmc<'static>, device: &BondedDevice) -> 
     let page_end = page_start + 4096;
     match nvmc.erase(page_start, page_end) {
         Ok(()) => {}
-        Err(e) => {
-            warn!("NVMC erase failed: {:?}", e);
+        Err(_) => {
+            warn!("NVMC erase failed");
             return false;
         }
     }
 
-    // Write padded record
     match nvmc.write(FLASH_BONDED_DEVICE_START, &padded[..PADDED]) {
         Ok(()) => {
             info!(
@@ -398,8 +432,8 @@ fn nvmc_write_bonded_device(nvmc: &mut Nvmc<'static>, device: &BondedDevice) -> 
             );
             true
         }
-        Err(e) => {
-            warn!("NVMC write failed: {:?}", e);
+        Err(_) => {
+            warn!("NVMC write failed");
             false
         }
     }
@@ -410,46 +444,77 @@ fn nvmc_read_bonded_device(nvmc: &mut Nvmc<'static>) -> Option<BondedDevice> {
     let mut record = [0u8; FLASH_RECORD_SIZE];
     match nvmc.read(FLASH_BONDED_DEVICE_START, &mut record) {
         Ok(()) => parse_flash_record(&record),
-        Err(e) => {
-            warn!("NVMC read failed: {:?}", e);
+        Err(_) => {
+            warn!("NVMC read failed");
             None
         }
     }
 }
 
-// ============================================================================
-// SENSOR LOOP
-// ============================================================================
-
-/// Read IMU at 20 Hz, validate, detect thrust, and push to SENSOR_CHANNEL.
-async fn sensor_loop(imu: &mut LSM6DS3TR<I2cInterface<Twim<'static>>>) {
-    loop {
-        if let Some(data) = read_sensor_data(imu) {
-            let accel_ok = data.accel_x.abs() < 10000
-                && data.accel_y.abs() < 10000
-                && data.accel_z.abs() < 10000;
-            let gyro_ok =
-                data.gyro_x.abs() < 20000 && data.gyro_y.abs() < 20000 && data.gyro_z.abs() < 20000;
-
-            if !accel_ok || !gyro_ok {
-                warn!("⚠️  sensor out of range");
-                Timer::after_millis(SENSOR_SAMPLING_INTERVAL_MS).await;
-                continue;
-            }
-
-            if detect_upward_thrust(data.accel_z) {
-                animate_led_thrust(200);
-            }
-
-            // Non-blocking push; drop sample if channel is full
-            let _ = SENSOR_CHANNEL.try_send(data);
-
-            info!(
-                "A:({},{},{}) G:({},{},{})",
-                data.accel_x, data.accel_y, data.accel_z, data.gyro_x, data.gyro_y, data.gyro_z
-            );
+/// Read the bonded device + 10-byte UID from flash.
+fn nvmc_read_bonded_device_full(nvmc: &mut Nvmc<'static>) -> Option<(BondedDevice, [u8; 10])> {
+    const FULL: usize = FLASH_RECORD_SIZE + 10;
+    let mut buf = [0u8; FULL];
+    match nvmc.read(FLASH_BONDED_DEVICE_START, &mut buf) {
+        Ok(()) => {
+            let mut record = [0u8; FLASH_RECORD_SIZE];
+            record.copy_from_slice(&buf[..FLASH_RECORD_SIZE]);
+            let dev = parse_flash_record(&record)?;
+            let mut uid = [0u8; 10];
+            uid.copy_from_slice(&buf[FLASH_RECORD_SIZE..]);
+            Some((dev, uid))
         }
-        Timer::after_millis(SENSOR_SAMPLING_INTERVAL_MS).await;
+        Err(_) => {
+            warn!("NVMC full read failed");
+            None
+        }
+    }
+}
+
+/// Write a full bonded device record (MAC + 10-byte NFC UID) to flash.
+///
+/// The record layout in flash is:
+///   Bytes 0–11:  Primary 12-byte flash record (magic + BondedDevice)
+///   Bytes 12–22: 10-byte NFC UID (appended immediately after)
+///
+/// Both regions are written in a single page erase+write cycle so they
+/// stay consistent even if power is lost between writes.
+fn nvmc_write_bonded_device_full(
+    nvmc: &mut Nvmc<'static>,
+    device: &BondedDevice,
+    uid: &[u8; 10],
+) -> bool {
+    let record = make_flash_record(device);
+
+    // Layout: [12-byte primary record][10-byte UID] = 22 bytes.
+    // Pad to 4-byte word boundary for NVMC.
+    const RAW: usize = FLASH_RECORD_SIZE + 10; // 22
+    const PADDED: usize = (RAW + 3) & !3; // 24
+    let mut buf = [0xFFu8; PADDED];
+    buf[..FLASH_RECORD_SIZE].copy_from_slice(&record);
+    buf[FLASH_RECORD_SIZE..FLASH_RECORD_SIZE + 10].copy_from_slice(uid);
+
+    let page_start = FLASH_BONDED_DEVICE_START & !0xFFF;
+    let page_end = page_start + 4096;
+    match nvmc.erase(page_start, page_end) {
+        Ok(()) => {}
+        Err(_) => {
+            warn!("NVMC erase failed (full record)");
+            return false;
+        }
+    }
+    match nvmc.write(FLASH_BONDED_DEVICE_START, &buf[..PADDED]) {
+        Ok(()) => {
+            info!(
+                "💾 NVMC write OK (full) – MAC {:?} UID {:?} @ 0x{:08X}",
+                device.mac, uid, FLASH_BONDED_DEVICE_START
+            );
+            true
+        }
+        Err(_) => {
+            warn!("NVMC write failed (full record)");
+            false
+        }
     }
 }
 
@@ -482,7 +547,7 @@ async fn main(spawner: Spawner) {
 
     // --- NFCT peripheral ---
     let nfct_config = NfcConfig {
-        nfcid1: NfcId::SingleSize([0x01, 0x02, 0x03, 0x04]),
+        nfcid1: NfcId::SingleSize([0x04, 0x01, 0x02, 0x03]),
         sdd_pat: SddPat::Sdd00000,
         plat_conf: 0x00,
         protocol: SelResProtocol::Type2,
@@ -512,13 +577,20 @@ async fn main(spawner: Spawner) {
 
     let nfc_detected = detect_nfc_field(&mut nfct, NFC_PAIRING_TIMEOUT_SECS * 1000).await;
 
-    // Extract NFC UID from the configured NfcId bytes (real UID comes from
-    // the activated tag; here we use the provisioned ID as a stand-in until
-    // the full NDEF/ISO14443-4 read path is wired up).
+    // Extract the NFC UID from the bytes returned by NFCT activation.
+    // A real tag provides its own UID bytes after activate() returns; this
+    // sample uses the configured four-byte Type 2 identifier.
+    //
+    // The validated UID is deposited into the shared NFC_UID static so
+    // pairing_mode() (and any future pairing logic) can read it without
+    // receiving it as a function argument.
     let nfc_uid: Option<[u8; 10]> = if nfc_detected {
-        // The 4-byte SingleSize NfcId we programmed → extract to 10-byte UID
-        let raw = [0x04u8, 0x01, 0x02, 0x03]; // matches nfcid1 above
-        extract_uid_from_nfct(&raw)
+        // These are the four bytes configured in NfcId::SingleSize.
+        let raw_nfcid = [0x04u8, 0x01, 0x02, 0x03];
+        let uid = parse_nfct_uid(&raw_nfcid);
+        // Deposit into the shared static so lib-level helpers can see it
+        store_activated_uid(&raw_nfcid);
+        uid
     } else {
         None
     };
@@ -527,24 +599,42 @@ async fn main(spawner: Spawner) {
     let bonded_mac: Option<[u8; 6]> = if nfc_detected {
         match existing_device {
             Some(ref dev) => {
-                info!("✅ NFC detected – existing bonded device confirmed");
-                Some(dev.mac)
+                let uid_matches = nfc_uid.is_some_and(|uid| {
+                    nvmc_read_bonded_device_full(&mut nvmc).is_some_and(|(stored, stored_uid)| {
+                        stored.mac == dev.mac
+                            && stored_uid == uid
+                            && stored.is_active()
+                            && stored.is_paired()
+                    })
+                });
+                if uid_matches {
+                    info!("✅ NFC detected – bonded MAC + UID confirmed");
+                    Some(dev.mac)
+                } else {
+                    warn!("❌ NFC detected – bonded UID authentication failed");
+                    None
+                }
             }
             None => {
                 info!("🆕 NFC detected – first-time pairing: registering new device");
-                // In a real flow the mobile app would write its MAC via NDEF.
-                // For now we store a placeholder MAC; the app will update it
-                // via the pairing_status characteristic write (future work).
+                // The mobile app will update the real MAC via the writable
+                // pairing_mac GATT characteristic once it connects.
+                // We store a placeholder MAC now so the device can advertise.
                 let new_mac = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
                 let mut dev = BondedDevice::new(new_mac);
                 dev.set_paired(true);
                 dev.set_verified(nfc_uid.is_some());
-                if nvmc_write_bonded_device(&mut nvmc, &dev) {
-                    info!("   Bonded device stored in flash");
-                }
-                // Also store full record with UID if available
+
                 if let Some(uid) = nfc_uid {
-                    info!("   NFC UID stored: {:?}", uid);
+                    // Write primary record + NFC UID together
+                    if nvmc_write_bonded_device_full(&mut nvmc, &dev, &uid) {
+                        info!("   Bonded device + UID stored in flash");
+                    }
+                } else {
+                    // No valid UID — write primary record only
+                    if nvmc_write_bonded_device(&mut nvmc, &dev) {
+                        info!("   Bonded device stored in flash (no UID)");
+                    }
                 }
                 Some(new_mac)
             }
@@ -606,20 +696,75 @@ async fn main(spawner: Spawner) {
         ..Default::default()
     };
 
-    let sd: &'static Softdevice = SD.init(Softdevice::enable(&sd_config));
-    let server: &'static Server = SERVER.init(unwrap!(Server::new(sd)));
+    let sd: &'static mut Softdevice = Softdevice::enable(&sd_config);
+    let server: &'static mut Server = SERVER.init(unwrap!(Server::new(sd)));
 
     // Softdevice event loop must run on its own task
-    unwrap!(spawner.spawn(softdevice_task(sd)));
+    spawner.spawn(unwrap!(softdevice_task(sd)));
 
     // =========================================================================
     // STEP 3 – SPAWN BLE TASK
     // =========================================================================
-    unwrap!(spawner.spawn(ble_task(sd, server, bonded_mac)));
+    spawner.spawn(unwrap!(ble_task(sd, server, bonded_mac)));
 
     // =========================================================================
-    // STEP 4 – MAIN SENSOR LOOP (runs in the main task, feeds SENSOR_CHANNEL)
+    // STEP 4 – MAIN LOOP: sensor sampling + MAC update from GATT writes
     // =========================================================================
     info!("📊 Sensor loop running at 20 Hz");
-    sensor_loop(&mut imu).await;
+    loop {
+        // Drain any pending MAC update from the mobile app (pairing_mac write)
+        if let Ok(new_mac) = MAC_UPDATE_CHANNEL.try_receive() {
+            info!(
+                "🔄 Updating bonded MAC from placeholder to real: {:?}",
+                new_mac
+            );
+            match nvmc_read_bonded_device_full(&mut nvmc) {
+                Some((mut dev, uid)) => {
+                    dev.mac = new_mac;
+                    // Preserve existing flags/timestamp, only update MAC
+                    if nvmc_write_bonded_device_full(&mut nvmc, &dev, &uid) {
+                        info!("   ✅ MAC persisted to flash (with preserved UID + flags)");
+                    }
+                }
+                None => {
+                    // No full record — try reading basic record only
+                    match nvmc_read_bonded_device(&mut nvmc) {
+                        Some(mut dev) => {
+                            dev.mac = new_mac;
+                            if nvmc_write_bonded_device(&mut nvmc, &dev) {
+                                info!("   ✅ MAC persisted to flash (no UID present)");
+                            }
+                        }
+                        None => {
+                            warn!("   No bonded record in flash – cannot update MAC");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Run one iteration of sensor sampling
+        if let Some(data) = read_sensor_data(&mut imu) {
+            let accel_ok = data.accel_x.abs() < 10000
+                && data.accel_y.abs() < 10000
+                && data.accel_z.abs() < 10000;
+            let gyro_ok =
+                data.gyro_x.abs() < 20000 && data.gyro_y.abs() < 20000 && data.gyro_z.abs() < 20000;
+
+            if !accel_ok || !gyro_ok {
+                warn!("⚠️  sensor out of range");
+            } else {
+                if detect_upward_thrust(data.accel_z) {
+                    animate_led_thrust(200);
+                }
+                let _ = SENSOR_CHANNEL.try_send(data);
+                info!(
+                    "A:({},{},{}) G:({},{},{})",
+                    data.accel_x, data.accel_y, data.accel_z, data.gyro_x, data.gyro_y, data.gyro_z
+                );
+            }
+        }
+
+        Timer::after_millis(SENSOR_SAMPLING_INTERVAL_MS).await;
+    }
 }
