@@ -57,19 +57,19 @@ version = "0.8.0"
 optional = true
 
 [dependencies.embassy-futures]
-version = "0.1"
+version = "0.1.2"
 optional = true
 
 [dependencies.defmt]
-version = "1.0"
+version = "1.1.1"
 optional = true
 
 [dependencies.defmt-rtt]
-version = "1.0"
+version = "1.3.0"
 optional = true
 
 [dependencies.panic-probe]
-version = "1.0"
+version = "1.0.0"
 optional = true
 
 [dependencies.lsm6ds3tr]
@@ -77,7 +77,7 @@ version = "0.2.2"
 optional = true
 
 [dependencies.cortex-m-rt]
-version = "0.7.6"
+version = "0.7.7"
 optional = true
 
 [dependencies.embassy-nrf]
@@ -91,12 +91,12 @@ version = "0.10.6"
 optional = true
 
 [dependencies.static_cell]
-version = "2.1"
+version = "2.1.1"
 optional = true
 
 # embedded-storage: NorFlash trait for NVMC flash operations
 [dependencies.embedded-storage]
-version = "0.3.1"
+version = "0.3.2"
 optional = true
 
 # nrf-softdevice: Pure-Rust async BLE bindings for the nRF52840 S140 SoftDevice.
