@@ -38,18 +38,19 @@ A high-tech sword sensor with real-time motion tracking, NFC pairing security, a
 - `memory.x` updated for S140: FLASH at `0x00026000` (after 152 KB softdevice), RAM at `0x20002000`
 - NFC UID shared-state pipeline: `parse_nfct_uid()` validates cascade-byte + extracts UID; `store_activated_uid()` / `peek_activated_uid()` / `clear_activated_uid()` manage a `CriticalSectionMutex`-wrapped shared static written from `main.rs` after `NfcT::activate()` and consumed by `pairing::pairing_mode()`
 - `nvmc_read_bonded_device_full()` reads the 22-byte primary-record + NFC-UID region atomically via NVMC
-- **Writable `pairing_mac` GATT characteristic (UUID `…0005`)**: the mobile app writes its real 6-byte BLE MAC here; `ble_task` forwards the value through `MAC_UPDATE_CHANNEL`, and the main loop consumes it and persists to flash via `nvmc_write_bonded_device_full` / `nvmc_write_bonded_device`, preserving the existing UID, flags, and timestamp
-- Desktop tests: **122 tests** — 34 base + 88 NFC-gated (run with `cargo test --features nfc`)
-  - Includes: `SensorData` serialisation round-trip, NFC UID validation, `extract_uid_from_nfct` / `parse_nfct_uid` extraction and cascade validation, flash record magic/round-trip/inactive-slot, `BleConfig` default/whitelist/interval, `BondedDeviceFull` round-trip and UID offset, `authenticate_with_uid`, `MAX_BONDED_DEVICES` page-fit, `BondedDevice` flag clear, `FLASH_RECORD_SIZE` constant, motion classification priority, placeholder-to-real MAC flash record replacement, `pairing_mac` value validation
+- **Writable `pairing_mac` GATT characteristic (UUID `…0005`)**: the mobile app writes its real 6-byte BLE MAC here; `ble_task` forwards the value through `MAC_UPDATE_CHANNEL`, and the main loop consumes it and persists to flash via SoftDevice Flash API (`nrf_softdevice::Flash`), preserving the existing UID, flags, and timestamp
+- **Runtime BLE whitelist hot-reload**: after a valid `pairing_mac` write or `ClearBondedDevices` TLV command, the main loop signals `WHITELIST_UPDATE_SIGNAL` so `ble_task` updates its active `bonded_mac` and GAP whitelist immediately without requiring a reboot
+- **SoftDevice Flash API migration (`nrf_softdevice::Flash`)**: all flash writes and erases use `embedded_storage_async::nor_flash::NorFlash` via `nrf_softdevice::Flash::take(sd)` (`sd_flash_write` / `sd_flash_page_erase`) at `0x000E_F000`, scheduled safely alongside S140 BLE radio events
+- **60-LED WS2812B animation engine (`led` module + `led_task` on `PWM0`/`P0.11`)**: 50 Hz frame generator (`LedEngine`) and 800 kHz GRB duty-cycle encoder (`encode_ws2812_pwm` via `SequencePwm`) supporting `UpwardThrust` (200 ms guard-to-tip wave), `DownwardSlash` (150 ms tip-to-guard wave), `ImpactHit` (100 ms flash decay), `IdleBreathing`, `MotionStop` (1000 ms fade), and `SolidColor` manual BLE overrides
+- **Binary GATT + TLV Command/Event API (`api` module + `command_control` UUID `…0006`)**: 16-byte Type-Length-Value (`[opcode, len, payload...]`) protocol for Web Bluetooth and mobile apps supporting `SetLedMode`, `SetBrightness`, `TriggerAnimation`, `SetThresholds`, `GetStatus`, `ClearBondedDevices`, and `CommandAck` / `GestureEvent` / `DeviceStatus` notifications
+- **Madgwick 6-DoF AHRS sensor fusion (`fusion` module + `orientation_data` UUID `…0007`)**: `no_std` quaternion estimator running at 20 Hz with zero-velocity gyroscope deadband and 8-byte Q14 fixed-point quaternion BLE streaming
+- **Live `NfcPairingStatus` tracking & Type 2 tag user-page validation**: atomic state store (`set_nfc_pairing_status` / `get_nfc_pairing_status`) synced to `pairing_status` (`…0004`) and page bounds checking (`4..=39`) in `nfc::write_nfc_page`
+- Desktop tests: **148 tests** — 57 base + 91 NFC-gated (run with `cargo test --features nfc`)
 
-### TODO
+### Future Hardware / Companion Milestones
 
-- LED animation engine (WS2812B via PWM on P0.11) — `animate_led_thrust()` is currently a logging stub
-- Mobile app for pairing, visualization, and real-time LED control (mobile app writes its MAC to the `pairing_mac` GATT characteristic, which is already wired on the firmware side)
-- Sensor fusion algorithms such as Madgwick AHRS
-- Flash the nRF-Softdevice S140 hex once before first use (see flashing instructions below)
-- After a runtime `pairing_mac` write, the new whitelist takes effect on the next reboot; `ble_task` does not currently hot-reload the whitelist mid-session
-- Production builds should migrate NVMC flash writes to the SoftDevice flash API (`sd_flash_write` / `sd_flash_page_erase`) instead of `embassy_nrf::nvmc::Nvmc` (see Flash Storage Layout note below)
+- Companion mobile / Web Bluetooth 3D visualizer client (consumes the GATT + TLV API specified below)
+- Flash the nRF-Softdevice S140 hex once before first use on a new board (see flashing instructions below)
 
 ## 1. Hardware: XIAO nRF52840 Sense + LSM6DS3TR IMU
 
@@ -329,11 +330,43 @@ Top-level crate functions (available with `nfc` or `embedded` feature):
 
 GATT server (`SwordSensorService`, UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`):
 
-| Characteristic   | UUID suffix | Properties    | Format                                                                                                                                      |
-| ---------------- | ----------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sensor_data`    | `…0003`     | Read + Notify | 12 bytes, i16 LE × 6 (accel XYZ, gyro XYZ)                                                                                                  |
-| `pairing_status` | `…0004`     | Read + Notify | 1 byte (0=Idle, 1=Scanning, 2=Auth, 3=Success, 4=Failed, 5=Timeout)                                                                         |
-| `pairing_mac`    | `…0005`     | Write         | 6-byte BLE MAC written by the mobile app to replace the first-time placeholder; forwarded via `MAC_UPDATE_CHANNEL` → main loop → NVMC flash |
+| Characteristic     | UUID suffix | Properties     | Format                                                                                                                                                   |
+| ------------------ | ----------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sensor_data`      | `…0003`     | Read + Notify  | 12 bytes, `i16` LE × 6 (`accel_x`, `accel_y`, `accel_z`, `gyro_x`, `gyro_y`, `gyro_z`) at 20 Hz                                                          |
+| `pairing_status`   | `…0004`     | Read + Notify  | 1 byte (`0`=Idle, `1`=Scanning, `2`=Authenticating, `3`=Success, `4`=Failed, `5`=Timeout)                                                                |
+| `pairing_mac`      | `…0005`     | Write          | 6-byte BLE MAC written by the central to replace the first-time placeholder; persisted via SoftDevice flash and hot-reloaded into the BLE whitelist       |
+| `command_control`  | `…0006`     | Write + Notify | 16-byte Type-Length-Value (TLV) Command/Event packet (`[opcode: u8, len: u8, payload...]`)                                                               |
+| `orientation_data` | `…0007`     | Read + Notify  | 8-byte Madgwick AHRS quaternion (`[w, x, y, z]` as `i16` LE in Q14 fixed-point, scale = `16384.0`) at 20 Hz                                              |
+
+#### TLV Command & Event API Specification (`command_control`, UUID `…0006`)
+
+All control commands and asynchronous device events use a 16-byte binary **Type-Length-Value (TLV)** envelope:
+
+```text
+┌────────────┬────────────┬────────────────────────────────────────┐
+│ Byte 0     │ Byte 1     │ Bytes 2 .. (2 + len)                   │
+│ opcode: u8 │ len: u8    │ payload (0..=14 bytes, little-endian)  │
+└────────────┴────────────┴────────────────────────────────────────┘
+```
+
+**Commands (Client → Sword):**
+
+| Opcode | Command              | `len`  | Payload Layout                                                                 | Description                                                                 |
+| ------ | -------------------- | ------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `0x01` | `SetLedMode`         | `6`    | `[mode: u8, r: u8, g: u8, b: u8, duration_ms: u16 LE]`                         | `mode`: `0` = AutoMotion, `1` = ManualOverride (`SolidColor(r,g,b)`)        |
+| `0x02` | `SetBrightness`      | `1`    | `[brightness: u8]`                                                             | Master WS2812B brightness (`0..=255`)                                       |
+| `0x03` | `TriggerAnimation`   | `3`/`6`| `[anim_id: u8, duration_ms: u16 LE, (optional r, g, b)]`                       | `anim_id`: `0`=Off, `1`=Idle, `2`=Thrust, `3`=Slash, `4`=Impact, `5`=Stop, `6`=Solid |
+| `0x04` | `SetThresholds`      | `4`    | `[thrust_threshold: i16 LE, impact_threshold: i16 LE]`                         | Update real-time gesture detection thresholds (`0 < thrust < impact`)       |
+| `0x05` | `GetStatus`          | `0`    | *(empty)*                                                                      | Request an immediate `DeviceStatus` (`0x82`) notification                   |
+| `0x06` | `ClearBondedDevices` | `0`    | *(empty)*                                                                      | Erase bonded flash page via SoftDevice Flash API and reopen BLE advertising |
+
+**Events / Responses (Sword → Client via Notify):**
+
+| Opcode | Event          | `len` | Payload Layout                                                                                               | Description                                                                                           |
+| ------ | -------------- | ----- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `0x80` | `CommandAck`   | `2`   | `[ref_opcode: u8, status: u8]`                                                                               | `status`: `0x00`=Ok, `0x01`=InvalidOpcode, `0x02`=InvalidLength, `0x03`=InvalidParam, `0x04`=StorageErr |
+| `0x81` | `GestureEvent` | `3`   | `[animation_id: u8, peak_accel: i16 LE]`                                                                     | Emitted immediately when a thrust, slash, or impact is detected                                       |
+| `0x82` | `DeviceStatus` | `8`   | `[pairing: u8, mode: u8, anim: u8, brightness: u8, thrust_thr: i16 LE, impact_thr: i16 LE]`                  | Full runtime status snapshot returned on `GetStatus` (`0x05`)                                         |
 
 #### Security Considerations
 

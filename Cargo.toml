@@ -21,6 +21,7 @@ embedded = [
   "linked_list_allocator",
   "static_cell",
   "embedded-storage",
+  "embedded-storage-async",
   "nrf-softdevice",
   "nrf-softdevice-s140",
 ]
@@ -97,6 +98,11 @@ optional = true
 # embedded-storage: NorFlash trait for NVMC flash operations
 [dependencies.embedded-storage]
 version = "0.3.2"
+optional = true
+
+# embedded-storage-async: Async NorFlash trait for nrf-softdevice Flash operations
+[dependencies.embedded-storage-async]
+version = "0.4.2"
 optional = true
 
 # nrf-softdevice: Pure-Rust async BLE bindings for the nRF52840 S140 SoftDevice.

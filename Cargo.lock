@@ -1272,6 +1272,7 @@ dependencies = [
  "embassy-time",
  "embedded-hal-async",
  "embedded-storage",
+ "embedded-storage-async",
  "linked_list_allocator",
  "lsm6ds3tr",
  "nrf-softdevice",

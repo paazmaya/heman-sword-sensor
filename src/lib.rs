@@ -17,6 +17,8 @@
 // ============================================================================
 
 pub const THRUST_THRESHOLD: i16 = 50; // Threshold for upward thrust detection (~0.5g)
+pub const SLASH_THRESHOLD: i16 = -50; // Threshold for downward slash detection (negative Z)
+pub const IMPACT_THRESHOLD: i16 = 300; // Threshold for high-jerk impact detection
 pub const NFC_PAIRING_TIMEOUT_SECS: u64 = 15;
 pub const SENSOR_SAMPLING_INTERVAL_MS: u64 = 50; // 20 Hz
 
@@ -123,6 +125,44 @@ pub enum MotionType {
     UpwardThrust,
 }
 
+/// Detect a sword combat gesture from 6-axis sensor data and map it to
+/// the corresponding [`led::LedAnimation`].
+///
+/// Priority order:
+/// 1. [`led::LedAnimation::ImpactHit`] — any axis exceeds `IMPACT_THRESHOLD`
+/// 2. [`led::LedAnimation::UpwardThrust`] — `accel_z > THRUST_THRESHOLD`
+/// 3. [`led::LedAnimation::DownwardSlash`] — `accel_z < SLASH_THRESHOLD` with pitch/roll rotation
+pub fn detect_sword_gesture(data: &SensorData) -> Option<led::LedAnimation> {
+    detect_sword_gesture_with_thresholds(data, THRUST_THRESHOLD, IMPACT_THRESHOLD)
+}
+
+/// Detect a sword combat gesture using configurable thrust and impact thresholds.
+pub fn detect_sword_gesture_with_thresholds(
+    data: &SensorData,
+    thrust_threshold: i16,
+    impact_threshold: i16,
+) -> Option<led::LedAnimation> {
+    let impact_limit = impact_threshold.saturating_abs().max(1);
+    if data.accel_x.saturating_abs() >= impact_limit
+        || data.accel_y.saturating_abs() >= impact_limit
+        || data.accel_z.saturating_abs() >= impact_limit
+    {
+        return Some(led::LedAnimation::ImpactHit);
+    }
+
+    if data.accel_z > thrust_threshold {
+        return Some(led::LedAnimation::UpwardThrust);
+    }
+
+    let slash_limit = -(thrust_threshold.saturating_abs().max(1));
+    let gyro_mag = (data.gyro_x as i32).abs() + (data.gyro_y as i32).abs();
+    if data.accel_z < slash_limit && (gyro_mag >= 40 || data.accel_y < slash_limit) {
+        return Some(led::LedAnimation::DownwardSlash);
+    }
+
+    None
+}
+
 // ============================================================================
 // VALIDATION FUNCTIONS
 // ============================================================================
@@ -161,6 +201,41 @@ pub enum NfcPairingStatus {
     Failed,
     /// NFC field not detected before timeout.
     Timeout,
+}
+
+impl NfcPairingStatus {
+    /// Convert to wire byte representation (0..=5).
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            NfcPairingStatus::Idle => 0,
+            NfcPairingStatus::Scanning => 1,
+            NfcPairingStatus::Authenticating => 2,
+            NfcPairingStatus::Success => 3,
+            NfcPairingStatus::Failed => 4,
+            NfcPairingStatus::Timeout => 5,
+        }
+    }
+
+    /// Parse from wire byte representation.
+    pub const fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(NfcPairingStatus::Idle),
+            1 => Some(NfcPairingStatus::Scanning),
+            2 => Some(NfcPairingStatus::Authenticating),
+            3 => Some(NfcPairingStatus::Success),
+            4 => Some(NfcPairingStatus::Failed),
+            5 => Some(NfcPairingStatus::Timeout),
+            _ => None,
+        }
+    }
+}
+
+static NFC_PAIRING_STATUS_STATE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Update the live NFC pairing status tracked by the firmware.
+pub fn set_nfc_pairing_status(status: NfcPairingStatus) {
+    NFC_PAIRING_STATUS_STATE.store(status.to_u8(), core::sync::atomic::Ordering::SeqCst);
 }
 
 // ============================================================================
@@ -483,21 +558,92 @@ pub mod nfc {
         detect_field_with_timeout(500).await
     }
 
-    /// Write 4 bytes to a Type 2 tag page (pages 4–19).
+    /// Minimum writable user-memory page on an ISO/IEC 14443 Type 2 tag.
+    pub const NFC_MIN_USER_PAGE: u8 = 4;
+    /// Maximum writable user-memory page supported by our tag shadow buffer (NTAG213 range).
+    pub const NFC_MAX_USER_PAGE: u8 = 39;
+    /// Total number of 4-byte user pages tracked in the shadow buffer.
+    pub const NFC_USER_PAGE_COUNT: usize = (NFC_MAX_USER_PAGE - NFC_MIN_USER_PAGE + 1) as usize;
+
+    static NFC_PAGE_SHADOW: [core::sync::atomic::AtomicU32; NFC_USER_PAGE_COUNT] = [
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+        core::sync::atomic::AtomicU32::new(0),
+    ];
+
+    /// Check whether `page` is within the writable Type 2 Tag user memory region (pages 4–39).
+    pub const fn is_valid_nfc_user_page(page: u8) -> bool {
+        page >= NFC_MIN_USER_PAGE && page <= NFC_MAX_USER_PAGE
+    }
+
+    /// Synchronously validate and store 4 bytes into a Type 2 tag user page (pages 4–39).
+    ///
+    /// Returns `false` if `page` is outside `[NFC_MIN_USER_PAGE..=NFC_MAX_USER_PAGE]`.
+    pub fn write_nfc_page_sync(page: u8, data: &[u8; 4]) -> bool {
+        if !is_valid_nfc_user_page(page) {
+            return false;
+        }
+        let idx = (page - NFC_MIN_USER_PAGE) as usize;
+        let word = u32::from_le_bytes(*data);
+        NFC_PAGE_SHADOW[idx].store(word, core::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// Read back 4 bytes from a Type 2 tag user page shadow buffer (pages 4–39).
+    pub fn read_nfc_page(page: u8) -> Option<[u8; 4]> {
+        if !is_valid_nfc_user_page(page) {
+            return None;
+        }
+        let idx = (page - NFC_MIN_USER_PAGE) as usize;
+        let word = NFC_PAGE_SHADOW[idx].load(core::sync::atomic::Ordering::SeqCst);
+        Some(word.to_le_bytes())
+    }
+
+    /// Write 4 bytes to a Type 2 tag page (pages 4–39).
     ///
     /// Type 2 tags are organised in 4-byte pages.  User memory starts at
     /// page 4 (byte address 16) and extends to page 15 (bytes 60–63) on
-    /// a standard 64-byte MIFARE Ultralight tag.  Larger tags (e.g.
-    /// NTAG213/215/216) support pages up to 19 or beyond.
-    ///
-    /// The actual WRITE command is issued through the NFCT peripheral in
-    /// `main.rs`.  This function is a stub that logs the intent; replace
-    /// the body with the real NFCT WRITE path when required.
+    /// a standard 64-byte MIFARE Ultralight tag, or up to page 39 on NTAG213.
     #[cfg(feature = "embedded")]
     pub async fn write_nfc_page(page: u8, data: &[u8; 4]) -> bool {
+        if !write_nfc_page_sync(page, data) {
+            defmt::warn!("⚠️  NFC WRITE rejected: invalid user page {}", page);
+            return false;
+        }
         defmt::info!("📡 NFC WRITE page {} data {:02x}", page, data);
-        // TODO: issue ISO 14443-3A WRITE command via NfcT.
-        // For now we return true so callers can continue without blocking.
         true
     }
 }
@@ -585,20 +731,17 @@ pub mod pairing {
         #[cfg(feature = "embedded")]
         defmt::info!("🔐 Authenticating device MAC: {:?}", mac);
 
-        match read_bonded_device() {
-            Some(device) if device.mac == *mac && device.is_active() && device.is_paired() => {
-                #[cfg(feature = "embedded")]
-                defmt::info!("✅ Authentication successful");
-                true
-            }
-            _ => {
-                #[cfg(feature = "embedded")]
-                defmt::warn!(
-                    "❌ Authentication failed – MAC not found or device not active/paired"
-                );
-                false
-            }
+        let authenticated = matches!(
+            read_bonded_device(),
+            Some(device) if device.mac == *mac && device.is_active() && device.is_paired()
+        );
+        #[cfg(feature = "embedded")]
+        if authenticated {
+            defmt::info!("✅ Authentication successful");
+        } else {
+            defmt::warn!("❌ Authentication failed – MAC not found or device not active/paired");
         }
+        authenticated
     }
 
     /// Authenticate using both the MAC address and the 10-byte NFC UID.
@@ -613,31 +756,52 @@ pub mod pairing {
             defmt::info!("   UID: {:?}", uid);
         }
 
-        match read_bonded_device_full() {
+        let authenticated = matches!(
+            read_bonded_device_full(),
             Some(device)
                 if device.dev.mac == *mac
                     && device.uid == *uid
                     && device.dev.is_active()
-                    && device.dev.is_paired() =>
-            {
-                #[cfg(feature = "embedded")]
-                defmt::info!("✅ MAC + UID authentication successful");
-                true
-            }
-            _ => {
-                #[cfg(feature = "embedded")]
-                defmt::warn!("❌ MAC + UID authentication failed");
-                false
-            }
+                    && device.dev.is_paired()
+        );
+        #[cfg(feature = "embedded")]
+        if authenticated {
+            defmt::info!("✅ MAC + UID authentication successful");
+        } else {
+            defmt::warn!("❌ MAC + UID authentication failed");
         }
+        authenticated
     }
 
-    /// Return the current pairing status.
-    ///
-    /// Stateless stub; a production implementation would track state
-    /// in a shared atomic or mutex-protected variable.
+    /// Return the current pairing status tracked in the shared atomic state.
     pub fn get_nfc_pairing_status() -> NfcPairingStatus {
-        NfcPairingStatus::Idle
+        let raw = NFC_PAIRING_STATUS_STATE.load(core::sync::atomic::Ordering::SeqCst);
+        NfcPairingStatus::from_u8(raw).unwrap_or(NfcPairingStatus::Idle)
+    }
+
+    /// Set the current pairing status tracked in the shared atomic state.
+    pub fn set_nfc_pairing_status(status: NfcPairingStatus) {
+        super::set_nfc_pairing_status(status);
+    }
+
+    /// First-time pairing placeholder MAC address stored prior to central registration.
+    pub const PLACEHOLDER_MAC: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+
+    /// Validate a 6-byte BLE MAC address written via `pairing_mac`.
+    ///
+    /// Rejects all-zero (`00:00:00:00:00:00`), broadcast (`FF:FF:FF:FF:FF:FF`),
+    /// and the internal first-time pairing placeholder (`DE:AD:BE:EF:00:01`).
+    pub fn is_valid_ble_mac(mac: &[u8; 6]) -> bool {
+        if mac.iter().all(|&b| b == 0x00) {
+            return false;
+        }
+        if mac.iter().all(|&b| b == 0xFF) {
+            return false;
+        }
+        if *mac == PLACEHOLDER_MAC {
+            return false;
+        }
+        true
     }
 
     // ------------------------------------------------------------------
@@ -941,21 +1105,25 @@ pub mod pairing {
 
         let start = Instant::now();
         let timeout = Duration::from_secs(NFC_PAIRING_TIMEOUT_SECS);
+        set_nfc_pairing_status(NfcPairingStatus::Scanning);
 
         loop {
             // Check whether main.rs has stored an activated UID
             if let Some(uid) = nfc::peek_activated_uid() {
                 defmt::info!("✅ NFC UID present – initiating pairing…");
+                set_nfc_pairing_status(NfcPairingStatus::Authenticating);
 
                 match read_bonded_device_full() {
                     Some(stored) => {
                         // Re-pairing: validate with stored MAC + stored UID
                         if authenticate_with_uid(&stored.dev.mac, &uid) {
                             defmt::info!("✅ MAC + UID authentication successful");
+                            set_nfc_pairing_status(NfcPairingStatus::Success);
                             nfc::clear_activated_uid();
                             return true;
                         } else {
                             defmt::warn!("❌ MAC + UID authentication failed");
+                            set_nfc_pairing_status(NfcPairingStatus::Failed);
                             nfc::clear_activated_uid();
                             return false;
                         }
@@ -967,10 +1135,10 @@ pub mod pairing {
                         defmt::warn!(
                             "⚠️  No bonded device in flash – registering NFC UID for first-time pairing"
                         );
-                        let placeholder_mac = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
-                        let mut dev = BondedDevice::new(placeholder_mac);
+                        let mut dev = BondedDevice::new(PLACEHOLDER_MAC);
                         dev.set_verified(true); // UID has been seen
                         write_bonded_device_to_flash_full(&dev);
+                        set_nfc_pairing_status(NfcPairingStatus::Success);
                         // Clear so we don't re-trigger on the next loop
                         nfc::clear_activated_uid();
                         // Return false – open advertising, MAC still placeholder
@@ -981,10 +1149,1003 @@ pub mod pairing {
 
             if start.elapsed() >= timeout {
                 defmt::info!("⏱️  NFC pairing timeout – falling back to BLE advertising");
+                set_nfc_pairing_status(NfcPairingStatus::Timeout);
                 return false;
             }
 
             Timer::after_millis(100).await;
+        }
+    }
+}
+
+// ============================================================================
+// PHASE 1: 60-LED WS2812B ANIMATION ENGINE & PWM ENCODER
+// ============================================================================
+
+/// WS2812B addressable LED animation engine and nRF52840 PWM sequence encoder.
+pub mod led {
+    /// Number of WS2812B LEDs along the sword blade (guard = index 0, tip = index 59).
+    pub const NUM_LEDS: usize = 60;
+    /// Frame update period in milliseconds (50 Hz).
+    pub const LED_FRAME_INTERVAL_MS: u32 = 20;
+    /// Number of PWM words per LED (24 bits: 8 G + 8 R + 8 B).
+    pub const BITS_PER_LED: usize = 24;
+    /// Number of trailing zero-duty PWM words for the ≥50 µs WS2812B reset latch (40 × 1.25 µs = 50 µs).
+    pub const RESET_SLOTS: usize = 40;
+    /// Total length of the `SequencePwm` DMA buffer in 16-bit half-words.
+    pub const PWM_BUFFER_WORDS: usize = NUM_LEDS * BITS_PER_LED + RESET_SLOTS; // 1480
+
+    /// nRF52 PWM countertop for 800 kHz at 16 MHz (`16 MHz / 800 kHz = 20` ticks = 1.25 µs).
+    pub const PWM_MAX_DUTY: u16 = 20;
+    /// Bit 15 inverted polarity flag required by nRF52 PWM peripheral so duty value = high time.
+    pub const PWM_POLARITY_BIT: u16 = 0x8000;
+    /// WS2812B `'0'` bit duty word: 6 ticks high (0.375 µs), 14 ticks low (0.875 µs).
+    pub const PWM_T0H_WORD: u16 = 6 | PWM_POLARITY_BIT;
+    /// WS2812B `'1'` bit duty word: 13 ticks high (0.8125 µs), 7 ticks low (0.4375 µs).
+    pub const PWM_T1H_WORD: u16 = 13 | PWM_POLARITY_BIT;
+    /// WS2812B reset latch word: 0 ticks high (continuous low).
+    pub const PWM_RESET_WORD: u16 = PWM_POLARITY_BIT;
+
+    /// Default upward thrust animation duration (200 ms).
+    pub const DURATION_THRUST_MS: u32 = 200;
+    /// Default downward slash animation duration (150 ms).
+    pub const DURATION_SLASH_MS: u32 = 150;
+    /// Default impact flash animation duration (100 ms).
+    pub const DURATION_IMPACT_MS: u32 = 100;
+    /// Default motion-stop fade duration (1000 ms).
+    pub const DURATION_MOTION_STOP_MS: u32 = 1000;
+    /// Full cycle period for continuous idle breathing (2000 ms).
+    pub const BREATHING_PERIOD_MS: u32 = 2000;
+
+    /// 24-bit RGB color value.
+    #[cfg_attr(feature = "embedded", derive(defmt::Format))]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct RgbColor {
+        pub r: u8,
+        pub g: u8,
+        pub b: u8,
+    }
+
+    impl RgbColor {
+        pub const BLACK: Self = Self::new(0, 0, 0);
+        pub const WHITE: Self = Self::new(255, 255, 255);
+        pub const GRAYSKULL_BLUE: Self = Self::new(80, 180, 255);
+        pub const SLASH_ORANGE: Self = Self::new(255, 70, 0);
+
+        /// Construct an RGB color.
+        pub const fn new(r: u8, g: u8, b: u8) -> Self {
+            Self { r, g, b }
+        }
+
+        /// Scale each channel by `scale` (`0..=255`).
+        pub const fn scale(self, scale: u8) -> Self {
+            let s = scale as u16;
+            Self {
+                r: ((self.r as u16 * s) / 255) as u8,
+                g: ((self.g as u16 * s) / 255) as u8,
+                b: ((self.b as u16 * s) / 255) as u8,
+            }
+        }
+    }
+
+    /// Sword blade LED animation patterns.
+    #[cfg_attr(feature = "embedded", derive(defmt::Format))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LedAnimation {
+        /// Slow continuous cyan/blue breathing glow when idle.
+        IdleBreathing,
+        /// Guard-to-tip white/blue energy wave on upward thrust (default 200 ms).
+        UpwardThrust,
+        /// Tip-to-guard red/orange wave on downward slash (default 150 ms).
+        DownwardSlash,
+        /// Full-blade bright white impact flash with decay (default 100 ms).
+        ImpactHit,
+        /// Smooth 1000 ms fade to off after motion stops.
+        MotionStop,
+        /// Static user-selected RGB color (e.g. set via BLE API).
+        SolidColor(RgbColor),
+        /// All LEDs off.
+        Off,
+    }
+
+    impl LedAnimation {
+        /// Numeric animation identifier used by the BLE TLV protocol.
+        pub const fn id(&self) -> u8 {
+            match self {
+                LedAnimation::Off => 0,
+                LedAnimation::IdleBreathing => 1,
+                LedAnimation::UpwardThrust => 2,
+                LedAnimation::DownwardSlash => 3,
+                LedAnimation::ImpactHit => 4,
+                LedAnimation::MotionStop => 5,
+                LedAnimation::SolidColor(_) => 6,
+            }
+        }
+
+        /// Construct an animation from a numeric ID and optional color.
+        pub const fn from_id(id: u8, color: RgbColor) -> Option<Self> {
+            match id {
+                0 => Some(LedAnimation::Off),
+                1 => Some(LedAnimation::IdleBreathing),
+                2 => Some(LedAnimation::UpwardThrust),
+                3 => Some(LedAnimation::DownwardSlash),
+                4 => Some(LedAnimation::ImpactHit),
+                5 => Some(LedAnimation::MotionStop),
+                6 => Some(LedAnimation::SolidColor(color)),
+                _ => None,
+            }
+        }
+
+        /// Default duration in milliseconds (`None` for continuous states).
+        pub const fn default_duration_ms(&self) -> Option<u32> {
+            match self {
+                LedAnimation::UpwardThrust => Some(DURATION_THRUST_MS),
+                LedAnimation::DownwardSlash => Some(DURATION_SLASH_MS),
+                LedAnimation::ImpactHit => Some(DURATION_IMPACT_MS),
+                LedAnimation::MotionStop => Some(DURATION_MOTION_STOP_MS),
+                LedAnimation::IdleBreathing | LedAnimation::SolidColor(_) | LedAnimation::Off => {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Operating mode for the LED engine.
+    #[cfg_attr(feature = "embedded", derive(defmt::Format))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LedControlMode {
+        /// Automatically trigger animations from IMU gestures.
+        AutoMotion,
+        /// Hold manual BLE-configured animation/color and ignore IMU gestures.
+        ManualOverride,
+    }
+
+    /// Deterministic 60-LED animation engine.
+    #[derive(Clone, Debug)]
+    pub struct LedEngine {
+        active: LedAnimation,
+        mode: LedControlMode,
+        elapsed_ms: u32,
+        duration_ms: Option<u32>,
+        brightness: u8,
+        last_frame: [RgbColor; NUM_LEDS],
+    }
+
+    impl Default for LedEngine {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl LedEngine {
+        /// Create a new `LedEngine` starting in `IdleBreathing` at full brightness (255).
+        pub const fn new() -> Self {
+            Self {
+                active: LedAnimation::IdleBreathing,
+                mode: LedControlMode::AutoMotion,
+                elapsed_ms: 0,
+                duration_ms: None,
+                brightness: 255,
+                last_frame: [RgbColor::BLACK; NUM_LEDS],
+            }
+        }
+
+        /// Return the currently active animation.
+        pub const fn current_animation(&self) -> LedAnimation {
+            self.active
+        }
+
+        /// Return the current control mode (`AutoMotion` vs `ManualOverride`).
+        pub const fn control_mode(&self) -> LedControlMode {
+            self.mode
+        }
+
+        /// Set the control mode.
+        pub fn set_control_mode(&mut self, mode: LedControlMode) {
+            self.mode = mode;
+        }
+
+        /// Return the global brightness (`0..=255`).
+        pub const fn brightness(&self) -> u8 {
+            self.brightness
+        }
+
+        /// Set global master brightness (`0..=255`).
+        pub fn set_brightness(&mut self, brightness: u8) {
+            self.brightness = brightness;
+        }
+
+        /// Trigger a motion animation using its default duration.
+        ///
+        /// Ignored if the engine is currently in [`LedControlMode::ManualOverride`].
+        pub fn trigger_motion(&mut self, anim: LedAnimation) {
+            if self.mode == LedControlMode::ManualOverride {
+                return;
+            }
+            self.start_animation(anim, anim.default_duration_ms());
+        }
+
+        /// Force-start an animation with an optional custom duration (in ms).
+        ///
+        /// If `duration_ms` is `Some(0)`, the animation's default duration is used.
+        pub fn start_animation(&mut self, anim: LedAnimation, duration_ms: Option<u32>) {
+            self.active = anim;
+            self.elapsed_ms = 0;
+            self.duration_ms = match duration_ms {
+                Some(0) => anim.default_duration_ms(),
+                Some(d) => Some(d),
+                None => anim.default_duration_ms(),
+            };
+        }
+
+        /// Advance the animation clock by `dt_ms` and render the 60-LED frame.
+        pub fn tick(&mut self, dt_ms: u32) -> [RgbColor; NUM_LEDS] {
+            // Check whether a transient animation has completed before rendering
+            if let Some(limit) = self.duration_ms {
+                if self.elapsed_ms >= limit {
+                    self.active = LedAnimation::IdleBreathing;
+                    self.elapsed_ms = 0;
+                    self.duration_ms = None;
+                }
+            }
+
+            let frame = match self.active {
+                LedAnimation::Off => [RgbColor::BLACK; NUM_LEDS],
+                LedAnimation::SolidColor(color) => [color; NUM_LEDS],
+                LedAnimation::IdleBreathing => self.render_idle_breathing(),
+                LedAnimation::UpwardThrust => {
+                    let dur = self.duration_ms.unwrap_or(DURATION_THRUST_MS).max(1);
+                    self.render_upward_thrust(dur)
+                }
+                LedAnimation::DownwardSlash => {
+                    let dur = self.duration_ms.unwrap_or(DURATION_SLASH_MS).max(1);
+                    self.render_downward_slash(dur)
+                }
+                LedAnimation::ImpactHit => {
+                    let dur = self.duration_ms.unwrap_or(DURATION_IMPACT_MS).max(1);
+                    self.render_impact_hit(dur)
+                }
+                LedAnimation::MotionStop => {
+                    let dur = self.duration_ms.unwrap_or(DURATION_MOTION_STOP_MS).max(1);
+                    self.render_motion_stop(dur)
+                }
+            };
+
+            self.elapsed_ms = self.elapsed_ms.saturating_add(dt_ms);
+            if self.active != LedAnimation::MotionStop {
+                self.last_frame = frame;
+            }
+            frame
+        }
+
+        fn render_idle_breathing(&self) -> [RgbColor; NUM_LEDS] {
+            let phase = self.elapsed_ms % BREATHING_PERIOD_MS;
+            let half = BREATHING_PERIOD_MS / 2;
+            // Triangle wave oscillating smoothly between intensity 20 and 120
+            let triangle = if phase < half {
+                phase
+            } else {
+                BREATHING_PERIOD_MS - phase
+            };
+            let level = (20 + (triangle * 100) / half) as u8;
+            let color = RgbColor::GRAYSKULL_BLUE.scale(level);
+            [color; NUM_LEDS]
+        }
+
+        fn render_upward_thrust(&self, duration_ms: u32) -> [RgbColor; NUM_LEDS] {
+            let mut leds = [RgbColor::BLACK; NUM_LEDS];
+            let clamped = self.elapsed_ms.min(duration_ms);
+            // Wavefront advances from guard (0) to tip (NUM_LEDS - 1)
+            let head = ((clamped as usize) * (NUM_LEDS - 1)) / (duration_ms as usize);
+            for (idx, led) in leds.iter_mut().enumerate() {
+                if idx <= head {
+                    let dist = head - idx;
+                    // Bright white tip at wavefront, decaying cyan/blue plasma trail toward guard
+                    let trail_scale = 255u16.saturating_sub((dist as u16) * 4) as u8;
+                    if dist <= 3 {
+                        *led = RgbColor::WHITE.scale(trail_scale);
+                    } else {
+                        *led = RgbColor::GRAYSKULL_BLUE.scale(trail_scale);
+                    }
+                }
+            }
+            leds
+        }
+
+        fn render_downward_slash(&self, duration_ms: u32) -> [RgbColor; NUM_LEDS] {
+            let mut leds = [RgbColor::BLACK; NUM_LEDS];
+            let clamped = self.elapsed_ms.min(duration_ms);
+            // Reverse wave: starts at tip (NUM_LEDS - 1) and sweeps down to guard (0)
+            let progress = ((clamped as usize) * (NUM_LEDS - 1)) / (duration_ms as usize);
+            let head = (NUM_LEDS - 1).saturating_sub(progress);
+            for (idx, led) in leds.iter_mut().enumerate() {
+                if idx >= head {
+                    let dist = idx - head;
+                    let trail_scale = 255u16.saturating_sub((dist as u16) * 5) as u8;
+                    *led = RgbColor::SLASH_ORANGE.scale(trail_scale);
+                }
+            }
+            leds
+        }
+
+        fn render_impact_hit(&self, duration_ms: u32) -> [RgbColor; NUM_LEDS] {
+            let clamped = self.elapsed_ms.min(duration_ms);
+            let remaining = duration_ms.saturating_sub(clamped);
+            // Quadratic decay from full white flash (255) to 0
+            let scale = ((remaining * remaining * 255) / (duration_ms * duration_ms)) as u8;
+            let color = RgbColor::WHITE.scale(scale);
+            [color; NUM_LEDS]
+        }
+
+        fn render_motion_stop(&self, duration_ms: u32) -> [RgbColor; NUM_LEDS] {
+            let clamped = self.elapsed_ms.min(duration_ms);
+            let remaining = duration_ms.saturating_sub(clamped);
+            let scale = ((remaining * 255) / duration_ms) as u8;
+            let mut leds = [RgbColor::BLACK; NUM_LEDS];
+            for (i, pixel) in leds.iter_mut().enumerate() {
+                let base = if self.last_frame[i] == RgbColor::BLACK {
+                    RgbColor::GRAYSKULL_BLUE.scale(80)
+                } else {
+                    self.last_frame[i]
+                };
+                *pixel = base.scale(scale);
+            }
+            leds
+        }
+    }
+
+    /// Encode a 60-LED RGB frame into nRF52840 `SequencePwm` 16-bit duty words.
+    ///
+    /// - WS2812B expects **GRB** byte order, MSB first (24 bits per pixel).
+    /// - Applies global `brightness` (`0..=255`) scaling before encoding.
+    /// - Appends [`RESET_SLOTS`] words of [`PWM_RESET_WORD`] (`0x8000`) for the ≥50 µs latch.
+    pub fn encode_ws2812_pwm(
+        leds: &[RgbColor; NUM_LEDS],
+        brightness: u8,
+        out: &mut [u16; PWM_BUFFER_WORDS],
+    ) {
+        let mut word_idx = 0usize;
+        for pixel in leds.iter() {
+            let scaled = pixel.scale(brightness);
+            let grb = [scaled.g, scaled.r, scaled.b];
+            for byte in grb {
+                for bit in (0..8).rev() {
+                    let is_one = (byte >> bit) & 1 != 0;
+                    out[word_idx] = if is_one { PWM_T1H_WORD } else { PWM_T0H_WORD };
+                    word_idx += 1;
+                }
+            }
+        }
+        while word_idx < PWM_BUFFER_WORDS {
+            out[word_idx] = PWM_RESET_WORD;
+            word_idx += 1;
+        }
+    }
+}
+
+// ============================================================================
+// PHASE 2: BLE GATT PROFILE & COMMAND/EVENT TLV API
+// ============================================================================
+
+/// Binary Type-Length-Value (TLV) Command & Event protocol for BLE clients
+/// (Web Bluetooth & Flutter mobile app).
+///
+/// Packet envelope (up to 16 bytes):
+/// ```text
+/// ┌────────────┬────────────┬────────────────────────────────────┐
+/// │ Byte 0     │ Byte 1     │ Bytes 2..(2 + len)                 │
+/// │ opcode: u8 │ len: u8    │ payload (0..=14 bytes, LE fields)  │
+/// └────────────┴────────────┴────────────────────────────────────┘
+/// ```
+pub mod api {
+    use crate::led::{LedAnimation, LedControlMode, RgbColor};
+
+    /// Fixed GATT characteristic buffer size for `command_control`.
+    pub const TLV_PACKET_SIZE: usize = 16;
+    /// Maximum payload length inside a 16-byte TLV packet.
+    pub const TLV_MAX_PAYLOAD_LEN: usize = TLV_PACKET_SIZE - 2;
+
+    // Command Opcodes (Client → Sword)
+    pub const OP_SET_LED_MODE: u8 = 0x01;
+    pub const OP_SET_BRIGHTNESS: u8 = 0x02;
+    pub const OP_TRIGGER_ANIMATION: u8 = 0x03;
+    pub const OP_SET_THRESHOLDS: u8 = 0x04;
+    pub const OP_GET_STATUS: u8 = 0x05;
+    pub const OP_CLEAR_BONDED_DEVICES: u8 = 0x06;
+
+    // Event/Response Opcodes (Sword → Client)
+    pub const EVT_COMMAND_ACK: u8 = 0x80;
+    pub const EVT_GESTURE: u8 = 0x81;
+    pub const EVT_DEVICE_STATUS: u8 = 0x82;
+
+    /// Status/error codes returned in [`ApiEvent::CommandAck`].
+    #[cfg_attr(feature = "embedded", derive(defmt::Format))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ApiStatus {
+        Ok = 0x00,
+        InvalidOpcode = 0x01,
+        InvalidLength = 0x02,
+        InvalidParameter = 0x03,
+        StorageError = 0x04,
+    }
+
+    impl ApiStatus {
+        pub const fn to_u8(self) -> u8 {
+            self as u8
+        }
+
+        pub const fn from_u8(val: u8) -> Option<Self> {
+            match val {
+                0x00 => Some(ApiStatus::Ok),
+                0x01 => Some(ApiStatus::InvalidOpcode),
+                0x02 => Some(ApiStatus::InvalidLength),
+                0x03 => Some(ApiStatus::InvalidParameter),
+                0x04 => Some(ApiStatus::StorageError),
+                _ => None,
+            }
+        }
+    }
+
+    /// Commands sent from the mobile/web client to the sword over `command_control` (`…0006`).
+    #[cfg_attr(feature = "embedded", derive(defmt::Format))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ApiCommand {
+        /// `0x01`: Set LED control mode (`0` = AutoMotion, `1` = ManualOverride), RGB color, and optional duration (ms).
+        SetLedMode {
+            mode: LedControlMode,
+            color: RgbColor,
+            duration_ms: u16,
+        },
+        /// `0x02`: Set global LED brightness (`0..=255`).
+        SetBrightness { brightness: u8 },
+        /// `0x03`: Trigger a specific blade animation immediately.
+        TriggerAnimation {
+            animation: LedAnimation,
+            duration_ms: u16,
+        },
+        /// `0x04`: Update motion detection thresholds (`thrust_threshold`, `impact_threshold`).
+        SetThresholds {
+            thrust_threshold: i16,
+            impact_threshold: i16,
+        },
+        /// `0x05`: Request a [`ApiEvent::DeviceStatus`] snapshot.
+        GetStatus,
+        /// `0x06`: Clear bonded device records and reopen BLE advertising.
+        ClearBondedDevices,
+    }
+
+    impl ApiCommand {
+        /// Return the TLV opcode byte for this command.
+        pub const fn opcode(&self) -> u8 {
+            match self {
+                ApiCommand::SetLedMode { .. } => OP_SET_LED_MODE,
+                ApiCommand::SetBrightness { .. } => OP_SET_BRIGHTNESS,
+                ApiCommand::TriggerAnimation { .. } => OP_TRIGGER_ANIMATION,
+                ApiCommand::SetThresholds { .. } => OP_SET_THRESHOLDS,
+                ApiCommand::GetStatus => OP_GET_STATUS,
+                ApiCommand::ClearBondedDevices => OP_CLEAR_BONDED_DEVICES,
+            }
+        }
+
+        /// Encode the command into a 16-byte TLV buffer.
+        pub fn encode(&self) -> [u8; TLV_PACKET_SIZE] {
+            let mut buf = [0u8; TLV_PACKET_SIZE];
+            buf[0] = self.opcode();
+            match *self {
+                ApiCommand::SetLedMode {
+                    mode,
+                    color,
+                    duration_ms,
+                } => {
+                    buf[1] = 6;
+                    buf[2] = match mode {
+                        LedControlMode::AutoMotion => 0,
+                        LedControlMode::ManualOverride => 1,
+                    };
+                    buf[3] = color.r;
+                    buf[4] = color.g;
+                    buf[5] = color.b;
+                    let dur = duration_ms.to_le_bytes();
+                    buf[6] = dur[0];
+                    buf[7] = dur[1];
+                }
+                ApiCommand::SetBrightness { brightness } => {
+                    buf[1] = 1;
+                    buf[2] = brightness;
+                }
+                ApiCommand::TriggerAnimation {
+                    animation,
+                    duration_ms,
+                } => {
+                    buf[1] = 6;
+                    buf[2] = animation.id();
+                    let dur = duration_ms.to_le_bytes();
+                    buf[3] = dur[0];
+                    buf[4] = dur[1];
+                    if let LedAnimation::SolidColor(c) = animation {
+                        buf[5] = c.r;
+                        buf[6] = c.g;
+                        buf[7] = c.b;
+                    }
+                }
+                ApiCommand::SetThresholds {
+                    thrust_threshold,
+                    impact_threshold,
+                } => {
+                    buf[1] = 4;
+                    buf[2..4].copy_from_slice(&thrust_threshold.to_le_bytes());
+                    buf[4..6].copy_from_slice(&impact_threshold.to_le_bytes());
+                }
+                ApiCommand::GetStatus | ApiCommand::ClearBondedDevices => {
+                    buf[1] = 0;
+                }
+            }
+            buf
+        }
+
+        /// Parse a TLV command from a raw byte slice (or 16-byte GATT write).
+        ///
+        /// On error, returns `(opcode, ApiStatus)` so the firmware can immediately
+        /// emit a matching [`ApiEvent::CommandAck`].
+        pub fn parse(raw: &[u8]) -> Result<Self, (u8, ApiStatus)> {
+            if raw.len() < 2 {
+                let op = raw.first().copied().unwrap_or(0);
+                return Err((op, ApiStatus::InvalidLength));
+            }
+            let opcode = raw[0];
+            let len = raw[1] as usize;
+            if len > TLV_MAX_PAYLOAD_LEN || raw.len() < 2 + len {
+                return Err((opcode, ApiStatus::InvalidLength));
+            }
+            let payload = &raw[2..2 + len];
+
+            match opcode {
+                OP_SET_LED_MODE => {
+                    if len != 6 {
+                        return Err((opcode, ApiStatus::InvalidLength));
+                    }
+                    let mode = match payload[0] {
+                        0 => LedControlMode::AutoMotion,
+                        1 => LedControlMode::ManualOverride,
+                        _ => return Err((opcode, ApiStatus::InvalidParameter)),
+                    };
+                    let color = RgbColor::new(payload[1], payload[2], payload[3]);
+                    let duration_ms = u16::from_le_bytes([payload[4], payload[5]]);
+                    Ok(ApiCommand::SetLedMode {
+                        mode,
+                        color,
+                        duration_ms,
+                    })
+                }
+                OP_SET_BRIGHTNESS => {
+                    if len != 1 {
+                        return Err((opcode, ApiStatus::InvalidLength));
+                    }
+                    Ok(ApiCommand::SetBrightness {
+                        brightness: payload[0],
+                    })
+                }
+                OP_TRIGGER_ANIMATION => {
+                    if len != 3 && len != 6 {
+                        return Err((opcode, ApiStatus::InvalidLength));
+                    }
+                    let color = if len == 6 {
+                        RgbColor::new(payload[3], payload[4], payload[5])
+                    } else {
+                        RgbColor::WHITE
+                    };
+                    let animation = LedAnimation::from_id(payload[0], color)
+                        .ok_or((opcode, ApiStatus::InvalidParameter))?;
+                    let duration_ms = u16::from_le_bytes([payload[1], payload[2]]);
+                    Ok(ApiCommand::TriggerAnimation {
+                        animation,
+                        duration_ms,
+                    })
+                }
+                OP_SET_THRESHOLDS => {
+                    if len != 4 {
+                        return Err((opcode, ApiStatus::InvalidLength));
+                    }
+                    let thrust_threshold = i16::from_le_bytes([payload[0], payload[1]]);
+                    let impact_threshold = i16::from_le_bytes([payload[2], payload[3]]);
+                    if thrust_threshold <= 0 || impact_threshold <= thrust_threshold {
+                        return Err((opcode, ApiStatus::InvalidParameter));
+                    }
+                    Ok(ApiCommand::SetThresholds {
+                        thrust_threshold,
+                        impact_threshold,
+                    })
+                }
+                OP_GET_STATUS => {
+                    if len != 0 {
+                        return Err((opcode, ApiStatus::InvalidLength));
+                    }
+                    Ok(ApiCommand::GetStatus)
+                }
+                OP_CLEAR_BONDED_DEVICES => {
+                    if len != 0 {
+                        return Err((opcode, ApiStatus::InvalidLength));
+                    }
+                    Ok(ApiCommand::ClearBondedDevices)
+                }
+                _ => Err((opcode, ApiStatus::InvalidOpcode)),
+            }
+        }
+    }
+
+    /// Events and responses sent from the sword to the client via `command_control` (`…0006`) notifications.
+    #[cfg_attr(feature = "embedded", derive(defmt::Format))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ApiEvent {
+        /// `0x80`: Command acknowledgement with original opcode and status code.
+        CommandAck { ref_opcode: u8, status: ApiStatus },
+        /// `0x81`: Real-time sword gesture notification with peak acceleration.
+        GestureEvent { animation_id: u8, peak_accel: i16 },
+        /// `0x82`: Full device state snapshot.
+        DeviceStatus {
+            pairing_status: u8,
+            led_mode: u8,
+            active_animation: u8,
+            brightness: u8,
+            thrust_threshold: i16,
+            impact_threshold: i16,
+        },
+    }
+
+    impl ApiEvent {
+        /// Encode the event into a 16-byte TLV packet.
+        pub fn encode(&self) -> [u8; TLV_PACKET_SIZE] {
+            let mut buf = [0u8; TLV_PACKET_SIZE];
+            match *self {
+                ApiEvent::CommandAck { ref_opcode, status } => {
+                    buf[0] = EVT_COMMAND_ACK;
+                    buf[1] = 2;
+                    buf[2] = ref_opcode;
+                    buf[3] = status.to_u8();
+                }
+                ApiEvent::GestureEvent {
+                    animation_id,
+                    peak_accel,
+                } => {
+                    buf[0] = EVT_GESTURE;
+                    buf[1] = 3;
+                    buf[2] = animation_id;
+                    buf[3..5].copy_from_slice(&peak_accel.to_le_bytes());
+                }
+                ApiEvent::DeviceStatus {
+                    pairing_status,
+                    led_mode,
+                    active_animation,
+                    brightness,
+                    thrust_threshold,
+                    impact_threshold,
+                } => {
+                    buf[0] = EVT_DEVICE_STATUS;
+                    buf[1] = 8;
+                    buf[2] = pairing_status;
+                    buf[3] = led_mode;
+                    buf[4] = active_animation;
+                    buf[5] = brightness;
+                    buf[6..8].copy_from_slice(&thrust_threshold.to_le_bytes());
+                    buf[8..10].copy_from_slice(&impact_threshold.to_le_bytes());
+                }
+            }
+            buf
+        }
+
+        /// Parse an `ApiEvent` from a raw byte slice.
+        pub fn parse(raw: &[u8]) -> Option<Self> {
+            if raw.len() < 2 {
+                return None;
+            }
+            let opcode = raw[0];
+            let len = raw[1] as usize;
+            if len > TLV_MAX_PAYLOAD_LEN || raw.len() < 2 + len {
+                return None;
+            }
+            let payload = &raw[2..2 + len];
+            match opcode {
+                EVT_COMMAND_ACK if len == 2 => Some(ApiEvent::CommandAck {
+                    ref_opcode: payload[0],
+                    status: ApiStatus::from_u8(payload[1])?,
+                }),
+                EVT_GESTURE if len == 3 => Some(ApiEvent::GestureEvent {
+                    animation_id: payload[0],
+                    peak_accel: i16::from_le_bytes([payload[1], payload[2]]),
+                }),
+                EVT_DEVICE_STATUS if len == 8 => Some(ApiEvent::DeviceStatus {
+                    pairing_status: payload[0],
+                    led_mode: payload[1],
+                    active_animation: payload[2],
+                    brightness: payload[3],
+                    thrust_threshold: i16::from_le_bytes([payload[4], payload[5]]),
+                    impact_threshold: i16::from_le_bytes([payload[6], payload[7]]),
+                }),
+                _ => None,
+            }
+        }
+    }
+}
+
+// ============================================================================
+// PHASE 3: MADGWICK AHRS SENSOR FUSION
+// ============================================================================
+
+/// 6-DoF Madgwick AHRS orientation filter (`no_std`, no external math dependencies).
+pub mod fusion {
+    use crate::SensorData;
+
+    /// Q14 fixed-point scale factor (`16384 = 2^14`) for compact 8-byte BLE quaternion packets.
+    pub const QUAT_Q14_SCALE: f32 = 16384.0;
+    /// Default Madgwick filter gain `beta` (rad/s).
+    pub const DEFAULT_MADGWICK_BETA: f32 = 0.1;
+    /// Default sensor sampling frequency (20 Hz).
+    pub const DEFAULT_SAMPLE_FREQ_HZ: f32 = 20.0;
+    /// Gyroscope stationary deadband (rad/s) for zero-velocity drift suppression.
+    pub const GYRO_DEADBAND_RAD_S: f32 = 0.015;
+
+    /// Fast `no_std` square root using Newton-Raphson iterations on IEEE-754 initial guess.
+    #[inline]
+    pub fn fast_sqrt(x: f32) -> f32 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let inv = fast_inv_sqrt(x);
+        x * inv
+    }
+
+    /// Fast `no_std` inverse square root (`1.0 / sqrt(x)`) with two Newton-Raphson refinement steps.
+    #[inline]
+    pub fn fast_inv_sqrt(x: f32) -> f32 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let xhalf = 0.5 * x;
+        let i = x.to_bits();
+        let i = 0x5f37_5a86 - (i >> 1);
+        let mut y = f32::from_bits(i);
+        y = y * (1.5 - xhalf * y * y);
+        y = y * (1.5 - xhalf * y * y);
+        y
+    }
+
+    /// 3D orientation quaternion `(w, x, y, z)`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Quaternion {
+        pub w: f32,
+        pub x: f32,
+        pub y: f32,
+        pub z: f32,
+    }
+
+    impl Default for Quaternion {
+        fn default() -> Self {
+            Self::IDENTITY
+        }
+    }
+
+    impl Quaternion {
+        /// Identity quaternion `(1, 0, 0, 0)`.
+        pub const IDENTITY: Self = Self {
+            w: 1.0,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+
+        /// Construct a quaternion.
+        pub const fn new(w: f32, x: f32, y: f32, z: f32) -> Self {
+            Self { w, x, y, z }
+        }
+
+        /// Compute the Euclidean norm `sqrt(w^2 + x^2 + y^2 + z^2)`.
+        pub fn norm(&self) -> f32 {
+            fast_sqrt(self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z)
+        }
+
+        /// Return a normalized unit quaternion.
+        pub fn normalized(&self) -> Self {
+            let n_sq = self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z;
+            if n_sq <= 1.0e-12 {
+                return Self::IDENTITY;
+            }
+            let inv = fast_inv_sqrt(n_sq);
+            Self {
+                w: self.w * inv,
+                x: self.x * inv,
+                y: self.y * inv,
+                z: self.z * inv,
+            }
+        }
+
+        /// Serialize to an 8-byte little-endian Q14 fixed-point array (`[w, x, y, z]` as `i16`).
+        pub fn to_q14_bytes(&self) -> [u8; 8] {
+            let q = self.normalized();
+            let clamp_q14 = |v: f32| -> i16 {
+                let scaled = v * QUAT_Q14_SCALE;
+                if scaled >= 16384.0 {
+                    16384
+                } else if scaled <= -16384.0 {
+                    -16384
+                } else if scaled >= 0.0 {
+                    (scaled + 0.5) as i16
+                } else {
+                    (scaled - 0.5) as i16
+                }
+            };
+            let w = clamp_q14(q.w).to_le_bytes();
+            let x = clamp_q14(q.x).to_le_bytes();
+            let y = clamp_q14(q.y).to_le_bytes();
+            let z = clamp_q14(q.z).to_le_bytes();
+            [w[0], w[1], x[0], x[1], y[0], y[1], z[0], z[1]]
+        }
+
+        /// Deserialize from an 8-byte little-endian Q14 fixed-point array.
+        pub fn from_q14_bytes(bytes: &[u8; 8]) -> Self {
+            let w = i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / QUAT_Q14_SCALE;
+            let x = i16::from_le_bytes([bytes[2], bytes[3]]) as f32 / QUAT_Q14_SCALE;
+            let y = i16::from_le_bytes([bytes[4], bytes[5]]) as f32 / QUAT_Q14_SCALE;
+            let z = i16::from_le_bytes([bytes[6], bytes[7]]) as f32 / QUAT_Q14_SCALE;
+            Self { w, x, y, z }.normalized()
+        }
+
+        /// Compute gravity direction vector `(gx, gy, gz)` in the sensor frame predicted by this quaternion.
+        pub fn gravity_vector(&self) -> (f32, f32, f32) {
+            let gx = 2.0 * (self.x * self.z - self.w * self.y);
+            let gy = 2.0 * (self.w * self.x + self.y * self.z);
+            let gz = self.w * self.w - self.x * self.x - self.y * self.y + self.z * self.z;
+            (gx, gy, gz)
+        }
+    }
+
+    /// Convert raw LSM6DS3TR accelerometer reading (`i16`) to `g` (assuming ±2g scale: 0.061 mg/LSB).
+    #[inline]
+    pub fn accel_lsb_to_g(lsb: i16) -> f32 {
+        lsb as f32 * 0.000_061
+    }
+
+    /// Convert raw LSM6DS3TR gyroscope reading (`i16`) to `rad/s` (assuming ±245 dps scale: 8.75 mdps/LSB).
+    #[inline]
+    pub fn gyro_lsb_to_rad_s(lsb: i16) -> f32 {
+        const DPS_TO_RAD: f32 = core::f32::consts::PI / 180.0;
+        lsb as f32 * 0.008_75 * DPS_TO_RAD
+    }
+
+    /// Madgwick 6-DoF IMU AHRS orientation estimator.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MadgwickAhrs {
+        q: Quaternion,
+        beta: f32,
+        inv_sample_freq: f32,
+    }
+
+    impl Default for MadgwickAhrs {
+        fn default() -> Self {
+            Self::new(DEFAULT_SAMPLE_FREQ_HZ, DEFAULT_MADGWICK_BETA)
+        }
+    }
+
+    impl MadgwickAhrs {
+        /// Create a new Madgwick AHRS filter for `sample_freq_hz` and gradient gain `beta`.
+        pub fn new(sample_freq_hz: f32, beta: f32) -> Self {
+            let freq = if sample_freq_hz > 0.0 {
+                sample_freq_hz
+            } else {
+                DEFAULT_SAMPLE_FREQ_HZ
+            };
+            Self {
+                q: Quaternion::IDENTITY,
+                beta,
+                inv_sample_freq: 1.0 / freq,
+            }
+        }
+
+        /// Return the current orientation quaternion.
+        pub const fn quaternion(&self) -> Quaternion {
+            self.q
+        }
+
+        /// Reset orientation to the identity quaternion.
+        pub fn reset(&mut self) {
+            self.q = Quaternion::IDENTITY;
+        }
+
+        /// Step the filter using a raw [`SensorData`] sample.
+        pub fn update_from_sensor_data(&mut self, data: &SensorData) -> Quaternion {
+            let gx = gyro_lsb_to_rad_s(data.gyro_x);
+            let gy = gyro_lsb_to_rad_s(data.gyro_y);
+            let gz = gyro_lsb_to_rad_s(data.gyro_z);
+            let ax = accel_lsb_to_g(data.accel_x);
+            let ay = accel_lsb_to_g(data.accel_y);
+            let az = accel_lsb_to_g(data.accel_z);
+            self.update_imu(gx, gy, gz, ax, ay, az)
+        }
+
+        /// Step the 6-DoF Madgwick IMU filter (`gx, gy, gz` in rad/s, `ax, ay, az` in any consistent unit).
+        pub fn update_imu(
+            &mut self,
+            mut gx: f32,
+            mut gy: f32,
+            mut gz: f32,
+            ax: f32,
+            ay: f32,
+            az: f32,
+        ) -> Quaternion {
+            // Apply zero-velocity update (ZUPT) deadband on near-zero gyro rates
+            if gx.abs() < GYRO_DEADBAND_RAD_S {
+                gx = 0.0;
+            }
+            if gy.abs() < GYRO_DEADBAND_RAD_S {
+                gy = 0.0;
+            }
+            if gz.abs() < GYRO_DEADBAND_RAD_S {
+                gz = 0.0;
+            }
+
+            let mut q0 = self.q.w;
+            let mut q1 = self.q.x;
+            let mut q2 = self.q.y;
+            let mut q3 = self.q.z;
+
+            // Rate of change of quaternion from gyroscope
+            let mut q_dot1 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz);
+            let mut q_dot2 = 0.5 * (q0 * gx + q2 * gz - q3 * gy);
+            let mut q_dot3 = 0.5 * (q0 * gy - q1 * gz + q3 * gx);
+            let mut q_dot4 = 0.5 * (q0 * gz + q1 * gy - q2 * gx);
+
+            // Compute feedback only if accelerometer measurement is non-zero
+            let accel_norm_sq = ax * ax + ay * ay + az * az;
+            if accel_norm_sq > 1.0e-12 {
+                let recip_norm = fast_inv_sqrt(accel_norm_sq);
+                let ax = ax * recip_norm;
+                let ay = ay * recip_norm;
+                let az = az * recip_norm;
+
+                // Auxiliary variables to avoid repeated arithmetic
+                let _2q0 = 2.0 * q0;
+                let _2q1 = 2.0 * q1;
+                let _2q2 = 2.0 * q2;
+                let _2q3 = 2.0 * q3;
+                let _4q0 = 4.0 * q0;
+                let _4q1 = 4.0 * q1;
+                let _4q2 = 4.0 * q2;
+                let _8q1 = 8.0 * q1;
+                let _8q2 = 8.0 * q2;
+                let q0q0 = q0 * q0;
+                let q1q1 = q1 * q1;
+                let q2q2 = q2 * q2;
+                let q3q3 = q3 * q3;
+
+                // Gradient descent corrective step
+                let s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+                let s1 = _4q1 * q3q3 - _2q3 * ax + 4.0 * q0q0 * q1 - _2q0 * ay - _4q1
+                    + _8q1 * q1q1
+                    + _8q1 * q2q2
+                    + _4q1 * az;
+                let s2 = 4.0 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2
+                    + _8q2 * q1q1
+                    + _8q2 * q2q2
+                    + _4q2 * az;
+                let s3 = 4.0 * q1q1 * q3 - _2q1 * ax + 4.0 * q2q2 * q3 - _2q2 * ay;
+
+                let s_norm_sq = s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+                if s_norm_sq > 1.0e-12 {
+                    let recip_s = fast_inv_sqrt(s_norm_sq);
+                    q_dot1 -= self.beta * s0 * recip_s;
+                    q_dot2 -= self.beta * s1 * recip_s;
+                    q_dot3 -= self.beta * s2 * recip_s;
+                    q_dot4 -= self.beta * s3 * recip_s;
+                }
+            }
+
+            // Integrate rate of change of quaternion
+            q0 += q_dot1 * self.inv_sample_freq;
+            q1 += q_dot2 * self.inv_sample_freq;
+            q2 += q_dot3 * self.inv_sample_freq;
+            q3 += q_dot4 * self.inv_sample_freq;
+
+            self.q = Quaternion::new(q0, q1, q2, q3).normalized();
+            self.q
         }
     }
 }

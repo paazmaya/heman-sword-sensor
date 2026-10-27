@@ -327,11 +327,13 @@ mod nfc_tests {
 
     #[test]
     fn test_get_nfc_pairing_status_top_level_returns_idle() {
+        xiao_nrf52840_sword::set_nfc_pairing_status(NfcPairingStatus::Idle);
         assert_eq!(get_nfc_pairing_status(), NfcPairingStatus::Idle);
     }
 
     #[test]
     fn test_pairing_module_get_status_returns_idle() {
+        xiao_nrf52840_sword::set_nfc_pairing_status(NfcPairingStatus::Idle);
         assert_eq!(pairing_status(), NfcPairingStatus::Idle);
     }
 
@@ -1101,5 +1103,491 @@ mod pairing_mac_tests {
         assert!(parsed.is_active());
         assert!(parsed.is_paired());
         assert!(parsed.is_verified());
+    }
+}
+
+// ============================================================================
+// Phase 1: 60-LED WS2812B Animation Engine & PWM Encoder Tests
+// ============================================================================
+
+mod led_engine_tests {
+    use xiao_nrf52840_sword::led::{
+        encode_ws2812_pwm, LedAnimation, LedControlMode, LedEngine, RgbColor, DURATION_IMPACT_MS,
+        DURATION_MOTION_STOP_MS, DURATION_SLASH_MS, DURATION_THRUST_MS, LED_FRAME_INTERVAL_MS,
+        NUM_LEDS, PWM_BUFFER_WORDS, PWM_POLARITY_BIT, PWM_RESET_WORD, PWM_T0H_WORD, PWM_T1H_WORD,
+        RESET_SLOTS,
+    };
+    use xiao_nrf52840_sword::{
+        detect_sword_gesture, detect_sword_gesture_with_thresholds, SensorData, IMPACT_THRESHOLD,
+        THRUST_THRESHOLD,
+    };
+
+    #[test]
+    fn test_led_strip_constants_for_60_leds() {
+        assert_eq!(NUM_LEDS, 60);
+        assert_eq!(LED_FRAME_INTERVAL_MS, 20); // 50 Hz
+        assert_eq!(PWM_BUFFER_WORDS, 60 * 24 + 40);
+        assert_eq!(PWM_BUFFER_WORDS, 1480);
+    }
+
+    #[test]
+    fn test_rgb_color_scaling() {
+        let color = RgbColor::new(200, 100, 50);
+        assert_eq!(color.scale(0), RgbColor::BLACK);
+        assert_eq!(color.scale(255), color);
+        let half = color.scale(128);
+        assert!(half.r >= 99 && half.r <= 101);
+        assert!(half.g >= 49 && half.g <= 51);
+    }
+
+    #[test]
+    fn test_led_animation_id_round_trip() {
+        let custom = RgbColor::new(12, 34, 56);
+        let variants = [
+            LedAnimation::Off,
+            LedAnimation::IdleBreathing,
+            LedAnimation::UpwardThrust,
+            LedAnimation::DownwardSlash,
+            LedAnimation::ImpactHit,
+            LedAnimation::MotionStop,
+            LedAnimation::SolidColor(custom),
+        ];
+        for anim in variants {
+            let id = anim.id();
+            let restored = LedAnimation::from_id(id, custom).expect("valid id");
+            assert_eq!(anim, restored);
+        }
+        assert!(LedAnimation::from_id(99, RgbColor::WHITE).is_none());
+    }
+
+    #[test]
+    fn test_led_engine_default_starts_in_idle_breathing() {
+        let mut engine = LedEngine::new();
+        assert_eq!(engine.current_animation(), LedAnimation::IdleBreathing);
+        assert_eq!(engine.control_mode(), LedControlMode::AutoMotion);
+        assert_eq!(engine.brightness(), 255);
+        let frame = engine.tick(20);
+        assert_eq!(frame.len(), 60);
+        // Idle breathing produces a non-black dim blue/cyan glow
+        assert!(frame[0].b > 0);
+    }
+
+    #[test]
+    fn test_upward_thrust_propagates_guard_to_tip_and_returns_to_idle() {
+        let mut engine = LedEngine::new();
+        engine.trigger_motion(LedAnimation::UpwardThrust);
+        assert_eq!(engine.current_animation(), LedAnimation::UpwardThrust);
+
+        // Frame 0 (t = 0 ms): guard LED (0) is lit, tip LED (59) is still dark
+        let frame_start = engine.tick(50);
+        assert_ne!(frame_start[0], RgbColor::BLACK);
+        assert_eq!(frame_start[NUM_LEDS - 1], RgbColor::BLACK);
+
+        // Advance to end of thrust (t = 200 ms): tip LED (59) is now lit
+        let _ = engine.tick(50); // t=50
+        let _ = engine.tick(50); // t=100
+        let _ = engine.tick(50); // t=150
+        let frame_end = engine.tick(20); // t=200 (duration limit)
+        assert_ne!(frame_end[NUM_LEDS - 1], RgbColor::BLACK);
+
+        // Next tick after duration elapses transitions back to IdleBreathing
+        assert!(DURATION_THRUST_MS == 200);
+        let _ = engine.tick(20);
+        assert_eq!(engine.current_animation(), LedAnimation::IdleBreathing);
+    }
+
+    #[test]
+    fn test_downward_slash_propagates_tip_to_guard() {
+        let mut engine = LedEngine::new();
+        engine.trigger_motion(LedAnimation::DownwardSlash);
+        assert_eq!(engine.current_animation(), LedAnimation::DownwardSlash);
+
+        // Frame 0 (t = 0 ms): tip LED (59) is lit, guard LED (0) is dark
+        let frame0 = engine.tick(50);
+        assert_ne!(frame0[NUM_LEDS - 1], RgbColor::BLACK);
+        assert_eq!(frame0[0], RgbColor::BLACK);
+
+        // Advance to end of 150 ms slash: guard LED (0) is lit
+        let _ = engine.tick(50);
+        let _ = engine.tick(50);
+        let frame_end = engine.tick(20); // t=150 ms
+        assert_ne!(frame_end[0], RgbColor::BLACK);
+        assert_eq!(DURATION_SLASH_MS, 150);
+    }
+
+    #[test]
+    fn test_impact_hit_flashes_bright_then_decays() {
+        let mut engine = LedEngine::new();
+        engine.trigger_motion(LedAnimation::ImpactHit);
+        let f0 = engine.tick(50);
+        let f1 = engine.tick(40);
+        // Starts full white (255) and decays at t=50 ms
+        assert_eq!(f0[0], RgbColor::WHITE);
+        assert!(f1[0].r < f0[0].r);
+        assert_eq!(DURATION_IMPACT_MS, 100);
+    }
+
+    #[test]
+    fn test_motion_stop_fades_over_1000_ms() {
+        let mut engine = LedEngine::new();
+        engine.start_animation(LedAnimation::SolidColor(RgbColor::WHITE), None);
+        let _ = engine.tick(20);
+        engine.start_animation(LedAnimation::MotionStop, None);
+        let start_frame = engine.tick(500);
+        let mid_frame = engine.tick(400);
+        assert!(mid_frame[0].r < start_frame[0].r);
+        assert_eq!(DURATION_MOTION_STOP_MS, 1000);
+    }
+
+    #[test]
+    fn test_manual_override_ignores_motion_triggers() {
+        let mut engine = LedEngine::new();
+        let purple = RgbColor::new(180, 0, 255);
+        engine.set_control_mode(LedControlMode::ManualOverride);
+        engine.start_animation(LedAnimation::SolidColor(purple), None);
+
+        // Motion gesture should be ignored while in ManualOverride
+        engine.trigger_motion(LedAnimation::UpwardThrust);
+        assert_eq!(engine.current_animation(), LedAnimation::SolidColor(purple));
+        let frame = engine.tick(20);
+        assert_eq!(frame[0], purple);
+        assert_eq!(frame[59], purple);
+    }
+
+    #[test]
+    fn test_encode_ws2812_pwm_grb_bit_order_and_reset_latch() {
+        let mut leds = [RgbColor::BLACK; NUM_LEDS];
+        // LED 0: G = 0xFF, R = 0x00, B = 0xAA (10101010)
+        leds[0] = RgbColor::new(0x00, 0xFF, 0xAA);
+
+        let mut pwm = [0u16; PWM_BUFFER_WORDS];
+        encode_ws2812_pwm(&leds, 255, &mut pwm);
+
+        // First 8 words = Green (0xFF -> all PWM_T1H_WORD)
+        for &w in &pwm[0..8] {
+            assert_eq!(w, PWM_T1H_WORD);
+            assert_ne!(w & PWM_POLARITY_BIT, 0);
+        }
+        // Next 8 words = Red (0x00 -> all PWM_T0H_WORD)
+        for &w in &pwm[8..16] {
+            assert_eq!(w, PWM_T0H_WORD);
+        }
+        // Next 8 words = Blue (0xAA = 0b1010_1010 -> alternating T1H, T0H)
+        for i in 0..8 {
+            let expected = if i % 2 == 0 {
+                PWM_T1H_WORD
+            } else {
+                PWM_T0H_WORD
+            };
+            assert_eq!(pwm[16 + i], expected);
+        }
+        // Final RESET_SLOTS words must all be PWM_RESET_WORD (0x8000)
+        for &w in &pwm[NUM_LEDS * 24..PWM_BUFFER_WORDS] {
+            assert_eq!(w, PWM_RESET_WORD);
+        }
+        assert_eq!(pwm[NUM_LEDS * 24..].len(), RESET_SLOTS);
+    }
+
+    #[test]
+    fn test_detect_sword_gesture_priority_and_thresholds() {
+        // Impact takes top priority
+        let impact = SensorData::new(IMPACT_THRESHOLD + 10, 0, THRUST_THRESHOLD + 20, 0, 0, 0);
+        assert_eq!(detect_sword_gesture(&impact), Some(LedAnimation::ImpactHit));
+
+        // Upward thrust
+        let thrust = SensorData::new(0, 0, THRUST_THRESHOLD + 15, 0, 0, 0);
+        assert_eq!(
+            detect_sword_gesture(&thrust),
+            Some(LedAnimation::UpwardThrust)
+        );
+
+        // Downward slash (negative Z accel + pitch/roll gyro)
+        let slash = SensorData::new(0, 0, -(THRUST_THRESHOLD + 20), 60, 0, 0);
+        assert_eq!(
+            detect_sword_gesture(&slash),
+            Some(LedAnimation::DownwardSlash)
+        );
+
+        // Idle sample triggers no gesture
+        let idle = SensorData::new(0, 0, 10, 0, 0, 0);
+        assert_eq!(detect_sword_gesture(&idle), None);
+
+        // Custom thresholds
+        assert_eq!(
+            detect_sword_gesture_with_thresholds(&thrust, 200, 500),
+            None
+        );
+    }
+}
+
+// ============================================================================
+// Phase 2: BLE Command/Event TLV Protocol Tests
+// ============================================================================
+
+mod tlv_api_tests {
+    use xiao_nrf52840_sword::api::{
+        ApiCommand, ApiEvent, ApiStatus, EVT_COMMAND_ACK, EVT_DEVICE_STATUS, EVT_GESTURE,
+        OP_CLEAR_BONDED_DEVICES, OP_GET_STATUS, OP_SET_BRIGHTNESS, OP_SET_LED_MODE,
+        OP_SET_THRESHOLDS, OP_TRIGGER_ANIMATION, TLV_PACKET_SIZE,
+    };
+    use xiao_nrf52840_sword::led::{LedAnimation, LedControlMode, RgbColor};
+
+    #[test]
+    fn test_tlv_set_led_mode_round_trip() {
+        let cmd = ApiCommand::SetLedMode {
+            mode: LedControlMode::ManualOverride,
+            color: RgbColor::new(10, 200, 255),
+            duration_ms: 1500,
+        };
+        let encoded = cmd.encode();
+        assert_eq!(encoded.len(), TLV_PACKET_SIZE);
+        assert_eq!(encoded[0], OP_SET_LED_MODE);
+        assert_eq!(encoded[1], 6);
+        let parsed = ApiCommand::parse(&encoded).expect("valid SetLedMode");
+        assert_eq!(cmd, parsed);
+    }
+
+    #[test]
+    fn test_tlv_set_brightness_round_trip() {
+        let cmd = ApiCommand::SetBrightness { brightness: 128 };
+        let encoded = cmd.encode();
+        assert_eq!(encoded[0], OP_SET_BRIGHTNESS);
+        assert_eq!(encoded[1], 1);
+        assert_eq!(ApiCommand::parse(&encoded), Ok(cmd));
+    }
+
+    #[test]
+    fn test_tlv_trigger_animation_round_trip() {
+        let cmd = ApiCommand::TriggerAnimation {
+            animation: LedAnimation::SolidColor(RgbColor::new(255, 0, 128)),
+            duration_ms: 500,
+        };
+        let encoded = cmd.encode();
+        assert_eq!(encoded[0], OP_TRIGGER_ANIMATION);
+        assert_eq!(ApiCommand::parse(&encoded), Ok(cmd));
+    }
+
+    #[test]
+    fn test_tlv_set_thresholds_round_trip_and_validation() {
+        let cmd = ApiCommand::SetThresholds {
+            thrust_threshold: 75,
+            impact_threshold: 450,
+        };
+        let encoded = cmd.encode();
+        assert_eq!(encoded[0], OP_SET_THRESHOLDS);
+        assert_eq!(ApiCommand::parse(&encoded), Ok(cmd));
+
+        // Invalid thresholds (impact <= thrust or non-positive thrust)
+        let bad = [OP_SET_THRESHOLDS, 4, 100, 0, 50, 0];
+        assert_eq!(
+            ApiCommand::parse(&bad),
+            Err((OP_SET_THRESHOLDS, ApiStatus::InvalidParameter))
+        );
+    }
+
+    #[test]
+    fn test_tlv_get_status_and_clear_bonds_round_trip() {
+        let get_status = ApiCommand::GetStatus;
+        assert_eq!(
+            ApiCommand::parse(&get_status.encode()),
+            Ok(ApiCommand::GetStatus)
+        );
+        assert_eq!(get_status.encode()[0], OP_GET_STATUS);
+
+        let clear = ApiCommand::ClearBondedDevices;
+        assert_eq!(
+            ApiCommand::parse(&clear.encode()),
+            Ok(ApiCommand::ClearBondedDevices)
+        );
+        assert_eq!(clear.encode()[0], OP_CLEAR_BONDED_DEVICES);
+    }
+
+    #[test]
+    fn test_tlv_invalid_opcode_and_length_errors() {
+        // Unknown opcode
+        assert_eq!(
+            ApiCommand::parse(&[0xFE, 0]),
+            Err((0xFE, ApiStatus::InvalidOpcode))
+        );
+        // Declared length exceeds slice
+        assert_eq!(
+            ApiCommand::parse(&[OP_SET_BRIGHTNESS, 5, 100]),
+            Err((OP_SET_BRIGHTNESS, ApiStatus::InvalidLength))
+        );
+        // Wrong payload length for SetBrightness
+        assert_eq!(
+            ApiCommand::parse(&[OP_SET_BRIGHTNESS, 2, 100, 0]),
+            Err((OP_SET_BRIGHTNESS, ApiStatus::InvalidLength))
+        );
+    }
+
+    #[test]
+    fn test_tlv_events_round_trip() {
+        let ack = ApiEvent::CommandAck {
+            ref_opcode: OP_SET_LED_MODE,
+            status: ApiStatus::Ok,
+        };
+        let ack_bytes = ack.encode();
+        assert_eq!(ack_bytes[0], EVT_COMMAND_ACK);
+        assert_eq!(ApiEvent::parse(&ack_bytes), Some(ack));
+
+        let gesture = ApiEvent::GestureEvent {
+            animation_id: LedAnimation::UpwardThrust.id(),
+            peak_accel: 420,
+        };
+        let gesture_bytes = gesture.encode();
+        assert_eq!(gesture_bytes[0], EVT_GESTURE);
+        assert_eq!(ApiEvent::parse(&gesture_bytes), Some(gesture));
+
+        let status = ApiEvent::DeviceStatus {
+            pairing_status: 3,
+            led_mode: 0,
+            active_animation: 1,
+            brightness: 200,
+            thrust_threshold: 50,
+            impact_threshold: 300,
+        };
+        let status_bytes = status.encode();
+        assert_eq!(status_bytes[0], EVT_DEVICE_STATUS);
+        assert_eq!(ApiEvent::parse(&status_bytes), Some(status));
+    }
+}
+
+// ============================================================================
+// Phase 3: Madgwick AHRS Sensor Fusion Tests
+// ============================================================================
+
+mod madgwick_fusion_tests {
+    use xiao_nrf52840_sword::fusion::{MadgwickAhrs, Quaternion};
+    use xiao_nrf52840_sword::SensorData;
+
+    #[test]
+    fn test_quaternion_identity_and_normalization() {
+        let q = Quaternion::IDENTITY;
+        assert!((q.norm() - 1.0).abs() < 1.0e-3);
+
+        let unnorm = Quaternion::new(2.0, 2.0, 2.0, 2.0).normalized();
+        assert!((unnorm.norm() - 1.0).abs() < 1.0e-3);
+        assert!((unnorm.w - 0.5).abs() < 1.0e-2);
+    }
+
+    #[test]
+    fn test_quaternion_q14_bytes_round_trip() {
+        let orig = Quaternion::new(0.7071, 0.0, 0.7071, 0.0).normalized();
+        let bytes = orig.to_q14_bytes();
+        assert_eq!(bytes.len(), 8);
+        let restored = Quaternion::from_q14_bytes(&bytes);
+        assert!((orig.w - restored.w).abs() < 1.0e-3);
+        assert!((orig.x - restored.x).abs() < 1.0e-3);
+        assert!((orig.y - restored.y).abs() < 1.0e-3);
+        assert!((orig.z - restored.z).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn test_madgwick_stationary_z_gravity_preserves_upright_orientation() {
+        let mut ahrs = MadgwickAhrs::new(20.0, 0.1);
+        for _ in 0..100 {
+            ahrs.update_imu(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        }
+        let q = ahrs.quaternion();
+        assert!((q.norm() - 1.0).abs() < 1.0e-2);
+        let (gx, gy, gz) = q.gravity_vector();
+        assert!(gx.abs() < 0.05);
+        assert!(gy.abs() < 0.05);
+        assert!(gz > 0.98);
+    }
+
+    #[test]
+    fn test_madgwick_converges_toward_tilted_x_gravity() {
+        let mut ahrs = MadgwickAhrs::new(50.0, 0.5);
+        for _ in 0..250 {
+            ahrs.update_imu(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        }
+        let (gx, gy, gz) = ahrs.quaternion().gravity_vector();
+        assert!(gx > 0.85, "expected gx > 0.85, got {}", gx);
+        assert!(gy.abs() < 0.1);
+        assert!(gz.abs() < 0.5);
+    }
+
+    #[test]
+    fn test_madgwick_yaw_gyro_integration_and_sensor_data_helper() {
+        let mut ahrs = MadgwickAhrs::default();
+        // ~90 deg/s yaw rotation (1.57 rad/s) for 10 steps at 20 Hz
+        for _ in 0..10 {
+            ahrs.update_imu(0.0, 0.0, 1.57, 0.0, 0.0, 1.0);
+        }
+        let q = ahrs.quaternion();
+        assert!(q.z > 0.25);
+        assert!((q.norm() - 1.0).abs() < 1.0e-2);
+
+        // Verify raw SensorData helper runs cleanly
+        let raw = SensorData::new(0, 0, 16384, 0, 0, 1000);
+        let q2 = ahrs.update_from_sensor_data(&raw);
+        assert!((q2.norm() - 1.0).abs() < 1.0e-2);
+    }
+}
+
+// ============================================================================
+// Phase 4 & 6: BLE MAC Validation, Live NfcPairingStatus, and NFC Page Writes
+// ============================================================================
+
+#[cfg(feature = "nfc")]
+mod phase4_and_6_tests {
+    use xiao_nrf52840_sword::nfc::{
+        is_valid_nfc_user_page, read_nfc_page, write_nfc_page_sync, NFC_MAX_USER_PAGE,
+        NFC_MIN_USER_PAGE,
+    };
+    use xiao_nrf52840_sword::pairing::{is_valid_ble_mac, PLACEHOLDER_MAC};
+    use xiao_nrf52840_sword::{get_nfc_pairing_status, set_nfc_pairing_status, NfcPairingStatus};
+
+    #[test]
+    fn test_is_valid_ble_mac_rejects_invalid_and_accepts_real() {
+        assert!(!is_valid_ble_mac(&[0x00; 6]));
+        assert!(!is_valid_ble_mac(&[0xFF; 6]));
+        assert!(!is_valid_ble_mac(&PLACEHOLDER_MAC));
+        assert!(is_valid_ble_mac(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+    }
+
+    #[test]
+    fn test_live_nfc_pairing_status_transitions_and_wire_bytes() {
+        let states = [
+            (NfcPairingStatus::Idle, 0),
+            (NfcPairingStatus::Scanning, 1),
+            (NfcPairingStatus::Authenticating, 2),
+            (NfcPairingStatus::Success, 3),
+            (NfcPairingStatus::Failed, 4),
+            (NfcPairingStatus::Timeout, 5),
+        ];
+        for (state, code) in states {
+            assert_eq!(state.to_u8(), code);
+            assert_eq!(NfcPairingStatus::from_u8(code), Some(state));
+            set_nfc_pairing_status(state);
+            assert_eq!(get_nfc_pairing_status(), state);
+        }
+        assert_eq!(NfcPairingStatus::from_u8(99), None);
+        // Reset back to Idle so other tests see the initial state if run later
+        set_nfc_pairing_status(NfcPairingStatus::Idle);
+    }
+
+    #[test]
+    fn test_nfc_type2_page_write_validation_and_shadow_readback() {
+        // Pages 0..=3 are reserved header/lock/CC pages — must be rejected
+        for reserved in 0..NFC_MIN_USER_PAGE {
+            assert!(!is_valid_nfc_user_page(reserved));
+            assert!(!write_nfc_page_sync(reserved, &[1, 2, 3, 4]));
+            assert!(read_nfc_page(reserved).is_none());
+        }
+
+        // Pages 4..=39 are valid user memory pages
+        let payload = [0xDE, 0xAD, 0xBE, 0xEF];
+        assert!(write_nfc_page_sync(4, &payload));
+        assert_eq!(read_nfc_page(4), Some(payload));
+
+        assert!(write_nfc_page_sync(NFC_MAX_USER_PAGE, &[9, 8, 7, 6]));
+        assert_eq!(read_nfc_page(NFC_MAX_USER_PAGE), Some([9, 8, 7, 6]));
+
+        // Out-of-bounds page > 39 must be rejected
+        assert!(!write_nfc_page_sync(NFC_MAX_USER_PAGE + 1, &[1, 1, 1, 1]));
+        assert!(read_nfc_page(NFC_MAX_USER_PAGE + 1).is_none());
     }
 }
