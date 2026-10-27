@@ -1,0 +1,48 @@
+name: Rust CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: rustup component add clippy rustfmt llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --features nfc -- -D warnings
+      - run: cargo check --locked --no-default-features
+      - run: cargo test --locked
+      - run: cargo test --locked --features nfc
+      - run: cargo test --locked --release
+      - run: cargo test --locked --release --features nfc
+      - run: cargo doc --locked --no-deps --features nfc
+        env:
+          RUSTDOCFLAGS: -D warnings -D missing_docs
+      - run: cargo test --locked --doc --features nfc
+      - uses: cargo-bins/cargo-binstall@18470a17439d5a7ec5f5ab40c95a6f0b217e652e
+      - run: cargo binstall --no-confirm cargo-tarpaulin@0.37.5
+      - run: cargo tarpaulin --locked --features nfc --engine llvm --out Xml --fail-under 95
+      - uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: cobertura.xml
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: rustup target add thumbv7em-none-eabihf
+      - run: rustup component add llvm-tools-preview clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --locked --release --features embedded --target thumbv7em-none-eabihf
+      - run: cargo clippy --locked --features embedded --target thumbv7em-none-eabihf --bin xiao_nrf52840_sword -- -D warnings
+      - run: bash scripts/check-firmware.sh

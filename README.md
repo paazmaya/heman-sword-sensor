@@ -1,854 +1,280 @@
 # He-Man Sword Sensor
 
-> By the power of Grayskull!
+Rust firmware for a **Seeed XIAO nRF52840 Sense** prop: onboard LSM6DS3TR
+motion sensing, relative orientation over BLE, and a 60-pixel WS2812B blade.
+Embassy runs the hardware tasks; Nordic S140 provides the BLE stack.
 
-A high-tech sword sensor with real-time motion tracking, NFC pairing security, and dynamic LED animations synchronized to your strikes. Track your swings with Bluetooth and watch the power flow through the blade.
+**Validation boundary:** host tests and ELF inspection do not establish that the
+board boots or that radio, NFC, timing, power, or LEDs work on hardware.
+Hardware smoke testing is still required. This is not a safety-certified prop.
 
-## Project Status
+## Developer quickstart
 
-### Completed
+Use the stable Rust toolchain selected by `rust-toolchain.toml`. Host tests need
+no board, SoftDevice image, or embedded feature. Run from the repository root:
 
-- Rust + Embassy embedded runtime working on nRF52840
-- I2C communication with LSM6DS3TR IMU at 100 kHz on TWIM0
-- 20 Hz sensor sampling with 50 ms intervals
-- Synchronous I2C reads with error handling
-- 12-byte sensor data structure for BLE transmission with `to_bytes` / `from_bytes` round-trip
-- 15-second NFC pairing gate with Bluetooth fallback
-- Multi-task architecture with `embassy_sync` channels and `embassy_futures::select`
-- Structured logging through `defmt 1.x` + RTT
-- `embassy-nrf` NFCT peripheral wired up with real hardware types (`NfcId`, `SddPat`, `SelResProtocol`, `Config`); `NfcT::new` + `nfct.activate()` called in `main.rs`
-- NFC field detection with configurable timeout via `embassy_time::with_timeout`
-- NFC UID extraction helper (`nfc::extract_uid_from_nfct`) and validation (`is_valid_uid`, `is_valid_uid_7`)
-- **NVMC flash peripheral wired**: `embassy_nrf::nvmc::Nvmc` used for real flash erase + word-aligned writes via `embedded_storage::NorFlash`; direct `read_volatile` reads at boot; `nvmc_write_bonded_device` and `nvmc_read_bonded_device` in `main.rs`
-- Flash record format: 12-byte records with magic byte (`0xAB`) + serialised `BondedDevice`; `make_flash_record` / `parse_flash_record` helpers in `pairing` module
-- `BondedDevice` struct with `to_bytes` / `from_bytes`, MAC, timestamp, and flag helpers (`is_active`, `is_paired`, `is_verified`, clear-capable setters)
-- `BondedDeviceFull` struct storing MAC + 10-byte NFC UID for secondary authentication
-- `NfcPairingStatus` enum covering all pairing lifecycle states
-- `pairing` module: `authenticate_bonded_device`, `authenticate_with_uid`, `read_bonded_device_mac`, `read_bonded_device`, `read_bonded_device_full`, `write_bonded_device_to_flash`, `write_bonded_device_to_flash_full`, `register_bonded_device`, `unregister_bonded_device`, `get_bonded_devices`, `is_bonded_device`, `get_nfc_pairing_status`
-- `nfc` module: `NfcFieldState`, `get_field_state`, `detect_field_with_timeout`, `detect_field`, `is_valid_uid`, `is_valid_uid_7`, `extract_uid_from_nfct`, `write_nfc_page`
-- `pairing::pairing_mode()` async gate: polls for NFC field, reads bonded MAC, authenticates, falls back to BLE on timeout
-- `BleConfig` struct with bonded MAC whitelist, advertising interval (units + ms helper), connection timeout, and `bonded_only()` constructor
-- **nrf-softdevice S140 BLE stack integrated**: `Softdevice::enable` with full `Config` (clock, GAP, GATT, GATTS attr table, device name)
-- **GATT server defined**: `SwordSensorService` with three characteristics — `sensor_data` (12-byte read/notify), `pairing_status` (1-byte read/notify), and `pairing_mac` (6-byte write for first-time MAC registration) — using custom 128-bit UUIDs
-- **BLE advertising task** (`ble_task`): advertises as "He-Man Sword", accepts connections, supports whitelist mode when a bonded device is present
-- **BLE sensor streaming task** (`stream_sensor_data_ble`): drains `SENSOR_CHANNEL` and sends notify updates to the connected central at 20 Hz
-- **Softdevice task** (`softdevice_task`): drives the S140 event loop on a dedicated embassy task
-- First-time pairing flow: NFC tap on a device with no stored record registers a new `BondedDevice` in NVMC flash
-- `nfc` Cargo feature: compiles `nfc` and `pairing` modules on the host target with no embedded hardware required
-- `memory.x` updated for S140: FLASH at `0x00026000` (after 152 KB softdevice), RAM at `0x20002000`
-- NFC UID shared-state pipeline: `parse_nfct_uid()` validates cascade-byte + extracts UID; `store_activated_uid()` / `peek_activated_uid()` / `clear_activated_uid()` manage a `CriticalSectionMutex`-wrapped shared static written from `main.rs` after `NfcT::activate()` and consumed by `pairing::pairing_mode()`
-- `nvmc_read_bonded_device_full()` reads the 22-byte primary-record + NFC-UID region atomically via NVMC
-- **Writable `pairing_mac` GATT characteristic (UUID `…0005`)**: the mobile app writes its real 6-byte BLE MAC here; `ble_task` forwards the value through `MAC_UPDATE_CHANNEL`, and the main loop consumes it and persists to flash via SoftDevice Flash API (`nrf_softdevice::Flash`), preserving the existing UID, flags, and timestamp
-- **Runtime BLE whitelist hot-reload**: after a valid `pairing_mac` write or `ClearBondedDevices` TLV command, the main loop signals `WHITELIST_UPDATE_SIGNAL` so `ble_task` updates its active `bonded_mac` and GAP whitelist immediately without requiring a reboot
-- **SoftDevice Flash API migration (`nrf_softdevice::Flash`)**: all flash writes and erases use `embedded_storage_async::nor_flash::NorFlash` via `nrf_softdevice::Flash::take(sd)` (`sd_flash_write` / `sd_flash_page_erase`) at `0x000E_F000`, scheduled safely alongside S140 BLE radio events
-- **60-LED WS2812B animation engine (`led` module + `led_task` on `PWM0`/`P0.11`)**: 50 Hz frame generator (`LedEngine`) and 800 kHz GRB duty-cycle encoder (`encode_ws2812_pwm` via `SequencePwm`) supporting `UpwardThrust` (200 ms guard-to-tip wave), `DownwardSlash` (150 ms tip-to-guard wave), `ImpactHit` (100 ms flash decay), `IdleBreathing`, `MotionStop` (1000 ms fade), and `SolidColor` manual BLE overrides
-- **Binary GATT + TLV Command/Event API (`api` module + `command_control` UUID `…0006`)**: 16-byte Type-Length-Value (`[opcode, len, payload...]`) protocol for Web Bluetooth and mobile apps supporting `SetLedMode`, `SetBrightness`, `TriggerAnimation`, `SetThresholds`, `GetStatus`, `ClearBondedDevices`, and `CommandAck` / `GestureEvent` / `DeviceStatus` notifications
-- **Madgwick 6-DoF AHRS sensor fusion (`fusion` module + `orientation_data` UUID `…0007`)**: `no_std` quaternion estimator running at 20 Hz with zero-velocity gyroscope deadband and 8-byte Q14 fixed-point quaternion BLE streaming
-- **Live `NfcPairingStatus` tracking & Type 2 tag user-page validation**: atomic state store (`set_nfc_pairing_status` / `get_nfc_pairing_status`) synced to `pairing_status` (`…0004`) and page bounds checking (`4..=39`) in `nfc::write_nfc_page`
-- Desktop tests: **148 tests** — 57 base + 91 NFC-gated (run with `cargo test --features nfc`)
+```sh
+rustup component add rustfmt clippy
+cargo fmt --all -- --check
+cargo check --locked --no-default-features
+cargo test --locked
+cargo test --locked --features nfc
+cargo test --locked --release
+cargo test --locked --release --features nfc
+cargo clippy --locked --all-targets --features nfc -- -D warnings
+RUSTDOCFLAGS='-D warnings -D missing_docs' cargo doc --locked --no-deps --features nfc
+cargo test --locked --doc --features nfc
+```
 
-### Future Hardware / Companion Milestones
+Open [generated API documentation](target/doc/xiao_nrf52840_sword/index.html)
+after `cargo doc`; its examples describe the actual public APIs.
+For host-library line coverage, install `cargo-tarpaulin` and run:
 
-- Companion mobile / Web Bluetooth 3D visualizer client (consumes the GATT + TLV API specified below)
-- Flash the nRF-Softdevice S140 hex once before first use on a new board (see flashing instructions below)
+```sh
+cargo tarpaulin --locked --features nfc --engine llvm --out Xml --fail-under 95
+```
 
-## 1. Hardware: XIAO nRF52840 Sense + LSM6DS3TR IMU
+The CI gate is **95% host-library line coverage**. The latest local NFC-feature
+run passed **165 integration tests plus 3 doctests**, measuring **98.20%**
+(818/833 executable host-library lines). This is not branch or embedded
+coverage. NFC-feature tests matter: default features do not exercise all
+pairing paths. Targeted mutations of byte order, a threshold boundary, an LED
+terminal frame, and the flash write were all rejected by the regression tests.
 
-### Board: Seeed XIAO nRF52840 Sense
+Features: default is empty; `nfc` enables host-testable NFC/pairing logic;
+`embedded` enables the ARM firmware and hardware dependencies. `std` is currently
+an empty compatibility feature, not a simulator or a different runtime.
 
-https://wiki.seeedstudio.com/XIAO_BLE/
+## Architecture and runtime
 
-| Feature          | Details                                                           |
-| ---------------- | ----------------------------------------------------------------- |
-| **MCU**          | nRF52840, ARM Cortex-M4, Bluetooth 5.0                            |
-| **IMU**          | LSM6DS3TR-C, 6-axis accelerometer + gyroscope                     |
-| **Connectivity** | Bluetooth 5.0 and built-in NFC Type 2 Tag / NFCT                  |
-| **Power**        | 3.3V, BQ25101 charging, approximately 300 mAh LiPo or larger      |
-| **Size**         | 20 x 17.5 mm, suitable for a sword handle                         |
-| **I2C Bus**      | IMU connected through TWIM0 on P0.26 SDA and P0.27 SCL at 100 kHz |
+The library contains deterministic logic; firmware adapters own peripherals.
+Compatibility re-exports in `lib.rs` preserve existing import paths.
+Persistence helpers now require an explicit backend and return errors instead
+of reporting success without writing. `BondedDeviceFull` encodes the actual
+22-byte flash envelope (including magic), and decoding can reject invalid data;
+the previous 21-byte helper format was inconsistent with firmware storage.
 
-### NFC Pairing Hardware
+| Location                                         | Responsibility                                                      |
+| ------------------------------------------------ | ------------------------------------------------------------------- |
+| `src/lib.rs`                                     | Crate documentation, feature gates, re-exports                      |
+| `src/sensor.rs`, `src/motion.rs`                 | Sensor codecs/units and gesture rules                               |
+| `src/led.rs`, `src/fusion.rs`                    | Animation/PWM encoding and Madgwick orientation                     |
+| `src/api.rs`, `src/control.rs`                   | BLE wire codecs and command dispatch/outcomes                       |
+| `src/nfc.rs`, `src/pairing.rs`, `src/storage.rs` | Local tag identity, registration, flash records                     |
+| `src/main.rs`                                    | Composition, task wiring, sampling; calls `process_storage_request` |
+| `src/firmware/board.rs`, `ble.rs`                | Board/IMU setup and GATT/advertising                                |
+| `src/firmware/flash.rs`, `led.rs`, `nfc.rs`      | Ordered storage processing, PWM output, NFC boot gate               |
+| `tests/`                                         | Host regressions and protocol/persistence scenarios                 |
 
-The nRF52840 Sense board includes a built-in NFC Type 2 Tag controller.
+Boot initializes the board, IMU, SoftDevice, and GATT server, then waits up to
+**15 seconds** for an external NFC reader to select the local tag. BLE advertising
+starts after this gate. NFC selection is **boot-only**; there is no continuous
+re-tap/re-pair loop.
 
-| Feature        | Details               |
-| -------------- | --------------------- |
-| **Peripheral** | NFCT, NFC Type 2 Tag  |
-| **Standard**   | ISO/IEC 14443 Type A  |
-| **Max Range**  | Approximately 10 cm   |
-| **Detection**  | Passive tag detection |
-| **UID Length** | 10 bytes              |
+On timeout, an existing usable record selects whitelist advertising; without a
+usable record, advertising remains open. Initial registration may store a
+placeholder MAC until the client writes a real address. Successful MAC
+persistence interrupts advertising immediately to refresh the whitelist without
+rebooting. While connected, the update applies only after that connection ends;
+it neither disconnects nor re-authenticates the active central. MAC replacement
+and clear requests share one storage FIFO, preserving their arrival order.
 
-### LED Strip: WS2812B / NeoPixel
+The sampling target is **20 Hz** and LED rendering is **50 Hz**, not guaranteed
+wall-clock delivery rates. Latest-value signals overwrite unread telemetry;
+responses have priority. On reconnect, latest data and queued events reset, and
+a connection epoch prevents stale deferred ACK delivery. BLE notification-buffer
+overflow is logged and telemetry skipped, not delivered losslessly.
 
-The sword features an LED strip that animates in real time based on motion.
+IMU packets contain raw counts, not SI units. Configured scales are ±2 g and
+±245 degrees/s (approximately 0.061 mg/LSB and 8.75 mdps/LSB).
+Gesture thresholds are uncalibrated raw-count settings, not physical impact or
+jerk measurements; gravity and mounting affect classification.
 
-| Component       | Details                                             |
-| --------------- | --------------------------------------------------- |
-| **LED Type**    | WS2812B addressable RGB, 5V                         |
-| **Control Pin** | Configurable GPIO, for example P0.11                |
-| **Behavior**    | Flash animation moves guard-to-tip on upward thrust |
-| **Power**       | External 5V source recommended for the strip        |
-| **Data Rate**   | 800 kHz WS2812B protocol                            |
+Fusion estimates **relative orientation**, not position. There is no
+magnetometer-based absolute yaw reference; yaw drifts. Acceleration includes
+gravity. Do not interpret orientation or gesture output as position tracking.
+Manual LED mode suppresses motion overrides. Thrust/slash/impact effects return
+to breathing; MotionStop fades to black and remains Off.
 
-Available GPIO pins after I2C/IMU:
+For a change, find the domain module above, add a focused regression under
+`tests/`, run that test with `--features nfc` where needed, then run the checks
+above. Hardware adapter changes also need the embedded build and smoke checks.
 
-- P0.02, P0.03, P0.04, P0.05, P0.06, P0.07
-- P0.08, P0.09, P0.10, P0.11
+## Board wiring and electrical safety
 
-### Sensor Specifications
+| Function                 | Pin / connection                                            |
+| ------------------------ | ----------------------------------------------------------- |
+| External WS2812B data    | **D0 / P0.02**, PWM0 output                                 |
+| Onboard IMU SDA / SCL    | **P0.07 / P0.27**                                           |
+| Onboard IMU power enable | **P1.08**, held high                                        |
+| Onboard IMU interrupt    | **P0.11**; not the external LED output                      |
+| NFC                      | Dedicated NFC antenna connection; attach a suitable antenna |
 
-The LSM6DS3TR provides:
+The onboard IMU is at I²C address `0x6A`. Its pins are internal board wiring:
+do not repurpose them for the strip. Follow Seeed's
+[Sense board pin mapping](https://github.com/Seeed-Studio/Adafruit_nRF52_Arduino/blob/master/variants/Seeed_XIAO_nRF52840_Sense/variant.cpp)
+and antenna guidance, not generic nRF52840 pin diagrams.
 
-- 3-axis accelerometer with configurable range: ±2, ±4, ±8, ±16 g
-- 3-axis gyroscope with configurable range: ±125, ±250, ±500, ±1000, ±2000 dps
-- Raw 16-bit integers for each axis
-- I2C address: 0x6A
+- Budget conservatively for **about 3.6 A at 5 V** for 60 pixels at full white
+  using the traditional **60 mA/pixel** estimate. Verify the actual LED variant;
+  this is a worst-case design estimate, not a measurement.
+- Use an appropriately rated **external regulated supply**, wiring, connectors,
+  current limiting/fusing, and a **common ground** with the controller.
+  Do not power the strip through the board's GPIO or assume its regulator/USB
+  path can supply the strip.
+- Use a suitable 3.3 V-to-strip-data **level shifter**; verify logic thresholds
+  and signal integrity for the actual strip and supply.
+- Use protected batteries and suitable charging/power circuitry. Software
+  brightness is not an electrical current limit or battery protection.
+- Insulate and strain-relieve connections; enclose batteries and electronics.
+  Secure components in a soft, safe prop and avoid striking people or objects.
 
-### Sensor Placement
+## One BLE protocol contract
 
-- Best location: 10-15 cm from the guard
-- Close to the wrist pivot for accurate rotational data
-- Far enough from the tip to avoid excessive linear acceleration noise
-- Avoid the sword tip or center of mass because they introduce centrifugal force noise
+Advertised name: **`He-Man Sword`**.
+Service UUID: **`6e400001-b5a3-f393-e0a9-e50e24dcca9e`**.
+In this table, `000N` means `6e40000N-b5a3-f393-e0a9-e50e24dcca9e`.
+All multi-byte integers are little-endian.
 
-## 2. Firmware: Rust + Embassy Framework
+| Characteristic   | UUID   | Properties    | Value                                                                        |
+| ---------------- | ------ | ------------- | ---------------------------------------------------------------------------- |
+| Sensor           | `0003` | Read, Notify  | 12 bytes: six `i16`, accel XYZ then gyro XYZ                                 |
+| Pairing status   | `0004` | Read, Notify  | 1 byte: 0 Idle, 1 Scanning, 2 Authenticating, 3 Success, 4 Failed, 5 Timeout |
+| Registration MAC | `0005` | Write         | 6 address bytes, passed directly to the BLE address constructor              |
+| Command/event    | `0006` | Write, Notify | Fixed 16-byte TLV packet                                                     |
+| Orientation      | `0007` | Read, Notify  | 8 bytes: `i16` Q14 quaternion `[w,x,y,z]`, divide by 16384                   |
 
-### Tech Stack
+Subscribe to command_control **before writing commands**; enable the other CCCDs
+as needed. Read/Notify properties do not promise every state transition is notified.
+Pairing status reflects the NFC/storage lifecycle, not automatic success on BLE
+connection. Sensor/orientation delivery
+targets 20 Hz. Registration writes are asynchronous, not proof of persistence.
+Address bytes are stack order, not a colon-separated string; clients must account
+for their platform's address representation.
 
-| Component                 | Version    | Purpose                                            |
-| ------------------------- | ---------- | -------------------------------------------------- |
-| **Embassy**               | 0.10.0     | Async runtime with executor, timers, and channels  |
-| **embassy-nrf**           | 0.11.0     | nRF HAL with NFCT, NVMC, TWIM peripheral support   |
-| **nrf-softdevice**        | git/master | S140 BLE stack bindings (peripheral + GATT server) |
-| **nrf-softdevice-s140**   | git/master | S140 SoftDevice FFI bindings                       |
-| **lsm6ds3tr**             | 0.2.2      | LSM6DS3TR IMU driver                               |
-| **defmt + defmt-rtt**     | 1.x        | Structured logging over RTT                        |
-| **embassy-sync**          | 0.8.0      | Inter-task channel communication                   |
-| **embassy-futures**       | 0.1        | `select` for concurrent async tasks                |
-| **embedded-storage**      | 0.3.1      | `NorFlash` trait for NVMC flash operations         |
-| **linked_list_allocator** | 0.10.6     | 4 KB heap allocator                                |
-| **panic-probe**           | 1.0        | Panic handler                                      |
+### TLV commands and responses (`0006`)
 
-### Code Architecture
+Every write/notification is 16 bytes: `[opcode:u8, len:u8, payload..., padding...]`.
+`len` counts payload bytes only (maximum 14) and must exactly match a length
+listed below. Truncated payloads and lengths above 14 are InvalidLength.
+Send zero padding; bytes outside the declared payload are ignored, not
+authenticated, and do not change the command.
 
-| Component                   | Purpose                                                                          | Build Target                 |
-| --------------------------- | -------------------------------------------------------------------------------- | ---------------------------- |
-| `src/lib.rs`                | Pure logic: motion detection, sensor validation, NFC/pairing/BLE data structures | Host `std`, desktop testable |
-| `src/main.rs`               | Embedded code: I2C, IMU, NFCT, NVMC flash, nrf-softdevice BLE, async tasks       | nRF52840 `no_std`            |
-| `tests/integration_test.rs` | Desktop tests for motion, validation, NFC, pairing, BLE config                   | Host `std`, `cargo test`     |
+| Opcode | Command            | Payload length | Payload in wire order                                   |
+| ------ | ------------------ | -------------- | ------------------------------------------------------- |
+| `01`   | SetLedMode         | 6              | `mode:u8, r:u8, g:u8, b:u8, duration_ms:u16`            |
+| `02`   | SetBrightness      | 1              | `brightness:u8` (0–255)                                 |
+| `03`   | TriggerAnimation   | 3 or 6         | `animation:u8, duration_ms:u16[, r:u8, g:u8, b:u8]`     |
+| `04`   | SetThresholds      | 4              | `thrust:i16, impact:i16`; require `0 < thrust < impact` |
+| `05`   | GetStatus          | 0              | Empty; requests ACK and DeviceStatus                    |
+| `06`   | ClearBondedDevices | 0              | Empty; erase stored registration and reopen advertising |
 
-Key design decisions:
+Mode IDs: `0` AutoMotion, `1` ManualOverride (solid RGB).
+Animation IDs: `0` Off, `1` IdleBreathing, `2` UpwardThrust,
+`3` DownwardSlash, `4` ImpactHit, `5` MotionStop, `6` SolidColor.
+Duration is milliseconds; zero selects the animation default/continuous behavior.
+For TriggerAnimation, omitted RGB defaults to white; RGB is used only for
+SolidColor and ignored for other animation IDs. Both payload forms are accepted
+for every valid animation ID.
 
-- Logic in `src/lib.rs` is testable without hardware using standard library traits (`Debug`, `PartialEq`, `Eq`)
-- Embedded-specific code stays in `src/main.rs` with embedded-specific traits (`defmt::Format`)
-- Optional dependencies and feature gates allow desktop testing without the nRF52840 target
-- NVMC flash reads use direct `read_volatile` (flash is memory-mapped on nRF52840); writes use `embedded_storage::NorFlash` via `embassy_nrf::nvmc::Nvmc`
-- nrf-softdevice S140 BLE stack runs as a dedicated embassy task (`softdevice_task`) and must be flashed once before first use
+| Opcode | Event        | Payload length | Payload in wire order                                                      |
+| ------ | ------------ | -------------- | -------------------------------------------------------------------------- |
+| `80`   | CommandAck   | 2              | `command_opcode:u8, status:u8`                                             |
+| `81`   | GestureEvent | 3              | `animation:u8, peak_accel:i16` (raw counts)                                |
+| `82`   | DeviceStatus | 8              | `pairing:u8, mode:u8, animation:u8, brightness:u8, thrust:i16, impact:i16` |
 
-### Boot Sequence
+ACK status codes remain `0` Ok, `1` InvalidOpcode, `2` InvalidLength,
+`3` InvalidParam, `4` StorageError (`0x04`, also used for command-queue rejection;
+there is no Busy code). These are distinct from pairing-status codes.
+LED ACK success means **queue acceptance**, not rendering; DeviceStatus changes
+only after the LED task applies the command. ClearBondedDevices ACK is sent
+**after erase completes**, reporting its outcome rather than queue acceptance.
+If the response queue is full, the command is logged and refused **before side
+effects**; the client must time out/retry. Notifications remain best-effort:
+serialize commands, and never treat a missing ACK as success. There is no
+transaction ID or delivery guarantee.
+
+Example packets (hex, each exactly 16 bytes):
 
 ```text
-1. Initialize 4 KB heap
-2. Initialize embassy-nrf peripherals
-   - gpiote and time interrupt priorities set to P2 (required by S140)
-3. Configure I2C on TWIM0
-   - SDA: P0.26
-   - SCL: P0.27
-   - Frequency: 100 kHz
-4. Initialize LSM6DS3TR IMU at address 0x6A
-5. Initialize NVMC flash driver
-6. Initialize NFCT peripheral (NFC Type 2 Tag)
-7. NFC pairing gate (15-second window)
-   - Read existing bonded device from NVMC flash
-   - Wait for NFC field via NfcT::activate()
-   - If detected + existing record: confirm bonded MAC
-   - If detected + no record: first-time pairing, write new BondedDevice to flash
-   - If timeout: use existing flash record (if any) or open advertising
-8. Enable nrf-softdevice S140
-   - Configure GAP device name, connection parameters, GATTS attr table
-9. Build GATT server (SwordSensorService)
-   - sensor_data characteristic (12-byte, notify)
-   - pairing_status characteristic (1-byte, read + notify)
-10. Spawn softdevice_task (S140 event loop)
-11. Spawn ble_task (advertise → connect → stream)
-12. Main sensor loop at 20 Hz (feeds SENSOR_CHANNEL → ble_task)
+GetStatus:         05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+SetBrightness 128: 02 01 80 00 00 00 00 00 00 00 00 00 00 00 00 00
+ACK brightness OK: 80 02 02 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
-### NFC Pairing
-
-The firmware uses NFC as the primary pairing gate. On boot, it waits up to 15 seconds for an NFC field. If a field is detected, it reads the bonded device from NVMC flash and authenticates the device using both the stored MAC and the NFC UID. If NFC times out, it falls back to BLE advertising using whatever bonded MAC is already in flash (if any).
-
-The implementation uses embassy-nrf's NFCT peripheral (`NfcT::new` + `nfct.activate()`) and the nRF52840 NVMC peripheral (`embassy_nrf::nvmc::Nvmc`) for persistent bonded-device storage. BLE is driven by the nrf-softdevice S140 stack via Rust async bindings.
-
-#### Architecture
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                    NFC PAIRING SYSTEM                        │
-├─────────────────────────────────────────────────────────────┤
-│  NFCT Peripheral ──▶ NFC Field Detection ──▶ Bonded Device  │
-│       │                    │                  Storage        │
-│       ▼                    ▼                    ▼            │
-│  Field Detected ──▶ Read MAC from Flash ──▶ Authenticate     │
-│       │                    │                    ▼            │
-│       ▼                    ▼                  Pairing         │
-│  Pairing Success ──▶ BLE Connection ──▶ Sensor Streaming      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Pairing Flow
-
-1. **Boot and initialization**
-   - Initialize NFCT peripheral
-   - Initialize I2C for IMU
-   - Start NFC pairing mode
-
-2. **NFC field detection**
-   - Listen for NFC Type 2 Tag field presence
-   - Poll every 100 ms
-   - Wait up to 15 seconds
-
-3. **Bonded device authentication**
-   - Read bonded MAC from flash
-   - Validate stored timestamp and flags
-   - Allow BLE connection only for the paired device
-
-4. **Pairing success**
-   - Establish secure BLE connection
-   - Start sensor data streaming
-   - Enable real-time motion tracking
-
-5. **Timeout fallback**
-   - If NFC does not complete within 15 seconds, switch to Bluetooth fallback mode
-
-#### Flash Storage Layout
-
-Bonded device data is stored starting at `0x000E_F000` (the last 4 KB page of the 1 MB flash, page-aligned and outside the application and SoftDevice regions).
-
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ nRF52840 flash address map (with S140 softdevice)            │
-├──────────────────────────────────────────────────────────────┤
-│ 0x00000000 - 0x00025FFF │ S140 SoftDevice (152 KB)           │
-│ 0x00026000 - 0x000EDFFF │ Application code (starts here)     │
-│ 0x000EF000 - 0x000EFFFF │ Bonded device storage (4 KB page)  │
-│                         │   Record format (12 bytes each):   │
-│                         │   - 1 byte  magic (0xAB)           │
-│                         │   - 6 bytes MAC address            │
-│                         │   - 4 bytes timestamp (LE u32)     │
-│                         │   - 1 byte  flags                  │
-│ 0x000FFFFF              │ End of flash (1 MB total)           │
-└──────────────────────────────────────────────────────────────┘
-```
-
-> **Note**: When the S140 SoftDevice is present, flash writes must go through the SoftDevice flash API (`sd_flash_write` / `sd_flash_page_erase`) to avoid conflicts with the radio scheduler. The current implementation uses `embassy_nrf::nvmc::Nvmc` directly, which is correct for bare-metal use (no softdevice loaded) or for development. Production builds with the softdevice should migrate flash writes to the softdevice flash API.
-
-#### Bonded Device Structure
-
-```rust
-#[repr(C)]
-struct BondedDevice {
-    mac: [u8; 6],      // MAC address
-    timestamp: u32,    // Last pairing timestamp
-    flags: u8,         // Active, paired, verified
-}
-```
-
-Flags:
-
-- Bit 0: active
-- Bit 1: paired
-- Bit 2: verified
-
-#### Pairing Status
-
-```rust
-enum NfcPairingStatus {
-    Idle,
-    Scanning,
-    Authenticating,
-    Success,
-    Failed,
-    Timeout,
-}
-```
-
-#### API Reference
-
-Top-level crate functions (available with `nfc` or `embedded` feature):
-
-| Function                       | Description                                             | Returns            |
-| ------------------------------ | ------------------------------------------------------- | ------------------ |
-| `authenticate_bonded_device()` | Verify bonded MAC (active + paired check)               | `bool`             |
-| `get_nfc_pairing_status()`     | Return current pairing status (currently always `Idle`) | `NfcPairingStatus` |
-
-`nfc` module (sync helpers available with `nfc` or `embedded`; async and embedded-only functions require `embedded`):
-
-| Function                           | Description                                                                    | Returns            |
-| ---------------------------------- | ------------------------------------------------------------------------------ | ------------------ |
-| `nfc::get_field_state()`           | Current field state (based on presence of stored activated UID)                | `NfcFieldState`    |
-| `nfc::is_valid_uid()`              | Validate 10-byte NFC UID (cascade tag byte 0x04 check, all-zero reject)        | `bool`             |
-| `nfc::is_valid_uid_7()`            | Validate 7-byte NFC UID                                                        | `bool`             |
-| `nfc::extract_uid_from_nfct()`     | Extract 10-byte canonical UID from raw NFCT bytes (4/7/10-byte inputs)         | `Option<[u8; 10]>` |
-| `nfc::parse_nfct_uid()`            | Extract + validate cascade-byte; thin wrapper used after `activate()`          | `Option<[u8; 10]>` |
-| `nfc::store_activated_uid()`       | Deposit raw bytes from `NfcT::activate()` into shared static — `embedded` only | (void)             |
-| `nfc::peek_activated_uid()`        | Read the last stored activated UID from shared static — `embedded` only        | `Option<[u8; 10]>` |
-| `nfc::clear_activated_uid()`       | Clear the shared activated UID (after pairing completes) — `embedded`          | (void)             |
-| `nfc::detect_field()`              | Detect NFC field (500 ms default) — async, polls `peek_activated_uid()`        | `bool`             |
-| `nfc::detect_field_with_timeout()` | Detect NFC field with custom timeout — async                                   | `bool`             |
-| `nfc::write_nfc_page()`            | Reserved Type 2 tag page-write API; currently logs and returns success         | `bool`             |
-
-`pairing` module (sync helpers available with `nfc` or `embedded`; async requires `embedded`):
-
-| Function                                       | Description                                                                                | Returns                    |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------ | -------------------------- |
-| `pairing::read_bonded_device_mac()`            | Read MAC from flash (NVMC on target, stub on host)                                         | `Option<[u8; 6]>`          |
-| `pairing::read_bonded_device()`                | Read `BondedDevice` from flash                                                             | `Option<BondedDevice>`     |
-| `pairing::read_bonded_device_full()`           | Read `BondedDeviceFull` (MAC + UID) from flash                                             | `Option<BondedDeviceFull>` |
-| `pairing::authenticate_bonded_device()`        | Verify MAC against stored record                                                           | `bool`                     |
-| `pairing::authenticate_with_uid()`             | Verify MAC + NFC UID against stored record                                                 | `bool`                     |
-| `pairing::get_nfc_pairing_status()`            | Current pairing status; state tracking is not wired yet                                    | `NfcPairingStatus`         |
-| `pairing::write_bonded_device_to_flash()`      | Write MAC to flash (delegates to NVMC in main.rs)                                          | `bool`                     |
-| `pairing::write_bonded_device_to_flash_full()` | Write full struct to flash                                                                 | `bool`                     |
-| `pairing::make_flash_record()`                 | Serialise device to 12-byte flash record                                                   | `[u8; 12]`                 |
-| `pairing::parse_flash_record()`                | Deserialise and validate a flash record                                                    | `Option<BondedDevice>`     |
-| `pairing::register_bonded_device()`            | Register new device                                                                        | `bool`                     |
-| `pairing::unregister_bonded_device()`          | Remove device                                                                              | `bool`                     |
-| `pairing::get_bonded_devices()`                | Get all bonded devices                                                                     | `[BondedDevice; 2]`        |
-| `pairing::is_bonded_device()`                  | Check if MAC is bonded (active records only)                                               | `bool`                     |
-| `pairing::pairing_mode()`                      | Reusable async pairing helper; boot currently uses the equivalent inline gate in `main.rs` | `bool`                     |
-
-`pairing::BleConfig`:
-
-| Method / Field             | Description                                        |
-| -------------------------- | -------------------------------------------------- |
-| `BleConfig::default()`     | Open advertising, 100 ms interval, no whitelist    |
-| `BleConfig::bonded_only()` | Whitelist config targeting a specific bonded MAC   |
-| `adv_interval_ms()`        | Advertising interval in milliseconds               |
-| `use_whitelist`            | When `true`, restricts advertising to `bonded_mac` |
-
-GATT server (`SwordSensorService`, UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`):
-
-| Characteristic     | UUID suffix | Properties     | Format                                                                                                                                                   |
-| ------------------ | ----------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sensor_data`      | `…0003`     | Read + Notify  | 12 bytes, `i16` LE × 6 (`accel_x`, `accel_y`, `accel_z`, `gyro_x`, `gyro_y`, `gyro_z`) at 20 Hz                                                          |
-| `pairing_status`   | `…0004`     | Read + Notify  | 1 byte (`0`=Idle, `1`=Scanning, `2`=Authenticating, `3`=Success, `4`=Failed, `5`=Timeout)                                                                |
-| `pairing_mac`      | `…0005`     | Write          | 6-byte BLE MAC written by the central to replace the first-time placeholder; persisted via SoftDevice flash and hot-reloaded into the BLE whitelist       |
-| `command_control`  | `…0006`     | Write + Notify | 16-byte Type-Length-Value (TLV) Command/Event packet (`[opcode: u8, len: u8, payload...]`)                                                               |
-| `orientation_data` | `…0007`     | Read + Notify  | 8-byte Madgwick AHRS quaternion (`[w, x, y, z]` as `i16` LE in Q14 fixed-point, scale = `16384.0`) at 20 Hz                                              |
-
-#### TLV Command & Event API Specification (`command_control`, UUID `…0006`)
-
-All control commands and asynchronous device events use a 16-byte binary **Type-Length-Value (TLV)** envelope:
-
-```text
-┌────────────┬────────────┬────────────────────────────────────────┐
-│ Byte 0     │ Byte 1     │ Bytes 2 .. (2 + len)                   │
-│ opcode: u8 │ len: u8    │ payload (0..=14 bytes, little-endian)  │
-└────────────┴────────────┴────────────────────────────────────────┘
-```
-
-**Commands (Client → Sword):**
-
-| Opcode | Command              | `len`  | Payload Layout                                                                 | Description                                                                 |
-| ------ | -------------------- | ------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `0x01` | `SetLedMode`         | `6`    | `[mode: u8, r: u8, g: u8, b: u8, duration_ms: u16 LE]`                         | `mode`: `0` = AutoMotion, `1` = ManualOverride (`SolidColor(r,g,b)`)        |
-| `0x02` | `SetBrightness`      | `1`    | `[brightness: u8]`                                                             | Master WS2812B brightness (`0..=255`)                                       |
-| `0x03` | `TriggerAnimation`   | `3`/`6`| `[anim_id: u8, duration_ms: u16 LE, (optional r, g, b)]`                       | `anim_id`: `0`=Off, `1`=Idle, `2`=Thrust, `3`=Slash, `4`=Impact, `5`=Stop, `6`=Solid |
-| `0x04` | `SetThresholds`      | `4`    | `[thrust_threshold: i16 LE, impact_threshold: i16 LE]`                         | Update real-time gesture detection thresholds (`0 < thrust < impact`)       |
-| `0x05` | `GetStatus`          | `0`    | *(empty)*                                                                      | Request an immediate `DeviceStatus` (`0x82`) notification                   |
-| `0x06` | `ClearBondedDevices` | `0`    | *(empty)*                                                                      | Erase bonded flash page via SoftDevice Flash API and reopen BLE advertising |
-
-**Events / Responses (Sword → Client via Notify):**
-
-| Opcode | Event          | `len` | Payload Layout                                                                                               | Description                                                                                           |
-| ------ | -------------- | ----- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| `0x80` | `CommandAck`   | `2`   | `[ref_opcode: u8, status: u8]`                                                                               | `status`: `0x00`=Ok, `0x01`=InvalidOpcode, `0x02`=InvalidLength, `0x03`=InvalidParam, `0x04`=StorageErr |
-| `0x81` | `GestureEvent` | `3`   | `[animation_id: u8, peak_accel: i16 LE]`                                                                     | Emitted immediately when a thrust, slash, or impact is detected                                       |
-| `0x82` | `DeviceStatus` | `8`   | `[pairing: u8, mode: u8, anim: u8, brightness: u8, thrust_thr: i16 LE, impact_thr: i16 LE]`                  | Full runtime status snapshot returned on `GetStatus` (`0x05`)                                         |
-
-#### Security Considerations
-
-- Only registered MAC addresses can pair
-- Bonded MAC addresses persist across reboots via NVMC flash
-- 12-byte flash records include a magic byte and active/paired flags to detect stale or erased slots
-- `authenticate_with_uid` adds a second factor: both the BLE MAC and the NFC UID must match
-- BLE advertising is restricted to the paired device when `BleConfig::use_whitelist` is true
-- Flash writes should go through the SoftDevice flash API in production (see flash storage note above)
-
-#### Testing NFC Pairing
-
-```bash
-# Build with embedded support (requires S140 softdevice pre-flashed on device)
-cargo build --features embedded --target thumbv7em-none-eabihf
-
-# Build release image for flashing
-cargo build --release --features embedded --target thumbv7em-none-eabihf
-
-# Run desktop tests (34 tests, no feature flag needed)
-cargo test --test integration_test
-
-# Run desktop tests including all NFC/pairing/BLE tests (122 tests)
-cargo test --test integration_test --features nfc
-
-# Run on hardware (requires S140 softdevice pre-flashed; see Flashing below)
-cargo run --release --features embedded --target thumbv7em-none-eabihf
-```
-
-NFC-specific tests cover:
-
-- `NfcPairingStatus` and `NfcFieldState` all variants
-- `BondedDevice` flag logic (active, paired, verified), clear-capable setters, and timestamp helpers
-- `BondedDevice` `to_bytes` / `from_bytes` round-trip and field layout
-- `BondedDeviceFull` (MAC + UID) serialisation round-trip and UID field offset
-- `authenticate_bonded_device` with matching and wrong MACs
-- `authenticate_with_uid` with correct and wrong MAC/UID combinations
-- NFC UID validation (`is_valid_uid`, `is_valid_uid_7`) — cascade tag byte, all-zero rejection
-- Flash record serialisation: `make_flash_record` / `parse_flash_record` round-trip, magic corruption, inactive slot
-- Flash storage constants (`FLASH_BONDED_DEVICE_START`, `FLASH_BONDED_DEVICE_SIZE`, `FLASH_RECORD_SIZE`, `FLASH_RECORD_MAGIC`, `MAX_BONDED_DEVICES` page-fit)
-- `BleConfig` default values, interval calculation, `bonded_only()` whitelist constructor
-- All pairing CRUD helpers (`read_bonded_device_mac`, `write_bonded_device_to_flash`, `register_bonded_device`, etc.)
-- `get_bonded_devices` and `is_bonded_device` lookups
-
-#### Troubleshooting
-
-| Issue                               | Check                                                         |
-| ----------------------------------- | ------------------------------------------------------------- |
-| NFC pairing times out               | Verify field detection, NFCT setup, and polling interval      |
-| Bonded device not found             | Verify MAC is stored in flash and the flash region is correct |
-| Authentication fails                | Verify MAC format, timestamp validity, and device flags       |
-| BLE is still visible to all devices | Confirm bonding and whitelist logic are implemented           |
-
-#### Current Implementation Status
-
-**Hardware types in use:**
-
-- `NfcId::SingleSize([0x01, 0x02, 0x03, 0x04])` — NFC identifier configuration
-- `SddPat::Sdd00000` — single device detection pattern
-- `SelResProtocol::Type2` — Type 2 Tag protocol selection
-- `embassy_nrf::nvmc::Nvmc` — NVMC flash driver for bonded device persistence
-
-**Hardware activation in `main.rs`:**
-
-```rust
-let nfct_config = NfcConfig {
-    nfcid1: NfcId::SingleSize([0x01, 0x02, 0x03, 0x04]),
-    sdd_pat: SddPat::Sdd00000,
-    plat_conf: 0x00,
-    protocol: SelResProtocol::Type2,
-};
-let mut nfct = NfcT::new(p.NFCT, Irqs, &nfct_config);
-let detected = embassy_time::with_timeout(
-    Duration::from_millis(timeout_ms),
-    nfct.activate(),
-).await;
-```
-
-**NVMC flash write in `main.rs`:**
-
-```rust
-// Erase the 4 KB page, then write a padded 12-byte record
-nvmc.erase(page_start, page_end)?;
-nvmc.write(FLASH_BONDED_DEVICE_START, &padded_record)?;
-```
-
-**GATT server in `main.rs` (proc-macro generated):**
-
-```rust
-#[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
-struct SwordSensorService {
-    #[characteristic(uuid = "6e400003-…", read, notify)]
-    sensor_data: [u8; 12],     // accel XYZ + gyro XYZ, i16 LE
-
-    #[characteristic(uuid = "6e400004-…", read, notify)]
-    pairing_status: u8,        // NfcPairingStatus numeric value
-
-    #[characteristic(uuid = "6e400005-…", write)]
-    pairing_mac: [u8; 6],      // mobile app writes its real BLE MAC here
-                               // to replace the first-time placeholder;
-                               // main loop drains MAC_UPDATE_CHANNEL and
-                               // persists via nvmc_write_bonded_device_full
-}
-```
-
-**Implementation notes / production gaps:**
-
-- The nRF52840 NFCT peripheral operates in **Type 2 Tag** mode; the configured `NfcId` bytes are the tag's own UID presented to an external reader. After `NfcT::activate()` the raw identifier is run through `parse_nfct_uid()` and stored via `store_activated_uid()`; existing bonded devices must match both the stored MAC and UID before whitelist advertising starts.
-- First-time pairing writes a placeholder MAC (`[0xDE,0xAD,0xBE,0xEF,0x00,0x01]`) to flash; the mobile app **must** write its real BLE MAC to the `pairing_mac` GATT characteristic (`…0005`) during its first connection. The firmware's main loop drains `MAC_UPDATE_CHANNEL` and persists the new MAC via `nvmc_write_bonded_device_full`, preserving the NFC UID, flags, and timestamp.
-- After a runtime `pairing_mac` write, the whitelist takes effect on the **next reboot**; `ble_task` does not currently hot-reload the whitelist or re-advertise mid-session.
-- Flash writes go through the NVMC driver directly; production builds should use `sd_flash_write` when S140 is loaded. The current storage address is `0x000E_F000`, not inside the SoftDevice region.
-
-#### Future Enhancements
-
-- Hot-reload the BLE whitelist after a `pairing_mac` GATT write (re-advertise with new bonded MAC without reboot)
-- LED animation engine (WS2812B via PWM on P0.11)
-- Madgwick AHRS sensor fusion
-- Multiple bonded devices across flash pages
-- OTA firmware update via DFU bootloader
-
-### Sensor Data Structure
-
-Data is packed into a 12-byte `SensorData` struct for efficient BLE transmission.
-
-```rust
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SensorData {
-    pub accel_x: i16,
-    pub accel_y: i16,
-    pub accel_z: i16,
-    pub gyro_x: i16,
-    pub gyro_y: i16,
-    pub gyro_z: i16,
-}
-
-impl SensorData {
-    pub fn new(
-        accel_x: i16,
-        accel_y: i16,
-        accel_z: i16,
-        gyro_x: i16,
-        gyro_y: i16,
-        gyro_z: i16,
-    ) -> Self { /* ... */ }
-
-    pub fn size() -> usize {
-        core::mem::size_of::<SensorData>()
-    }
-}
-```
-
-### Sensor Sampling
-
-- Frequency: 20 Hz, 50 ms interval
-- Method: synchronous I2C reads with error handling
-- Fallback: skip failed reads and log warnings
-- Communication: non-blocking `try_send()` to BLE channel
-- Validation: range-check sensor data before processing
-
-```rust
-async fn main_sensor_loop(imu: &mut LSM6DS3TR<I2cInterface<Twim>>) {
-    loop {
-        if let Some(data) = read_sensor_data(imu) {
-            if !validate_sensor_data(&data) {
-                continue;
-            }
-
-            if detect_upward_thrust(data.accel_z) {
-                animate_led_thrust(200);
-            }
-
-            let _ = SENSOR_CHANNEL.try_send(data);
-        }
-
-        Timer::after_millis(50).await;
-    }
-}
-```
-
-### Refactored Core Functions
-
-| Function                                                                        | Purpose                                                                                        | Status                                               |
-| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| `init_i2c()`                                                                    | Configure TWIM0 I2C pins and frequency                                                         | Implemented                                          |
-| `init_imu()`                                                                    | Initialize LSM6DS3TR sensor                                                                    | Implemented                                          |
-| `read_sensor_data()`                                                            | Single IMU read for accelerometer and gyroscope                                                | Implemented                                          |
-| `detect_nfc_field()`                                                            | Wait for NFC field via `NfcT::activate()` with timeout                                         | Implemented in `main.rs`                             |
-| `nfc::parse_nfct_uid()`                                                         | Extract + validate cascade-byte UID after `NfcT::activate()`                                   | Implemented and tested (host)                        |
-| `nfc::store_activated_uid()` / `peek_activated_uid()` / `clear_activated_uid()` | Shared UID static via `CriticalSectionMutex` — written in boot gate, read in `pairing_mode()`  | Implemented (`embedded` only)                        |
-| `nvmc_write_bonded_device()`                                                    | Erase flash page and write 12-byte bonded device record                                        | Implemented in `main.rs`                             |
-| `nvmc_write_bonded_device_full()`                                               | Write primary record + 10-byte NFC UID atomically (single erase+write)                         | Implemented in `main.rs`                             |
-| `nvmc_read_bonded_device()`                                                     | Read bonded device record from flash via NVMC                                                  | Implemented in `main.rs`                             |
-| `nvmc_read_bonded_device_full()`                                                | Read 22-byte primary + UID region atomically via NVMC                                          | Implemented in `main.rs`                             |
-| `MAC_UPDATE_CHANNEL` drain (main loop)                                          | Receive `pairing_mac` GATT writes → update bonded MAC in flash (preserves UID/flags/timestamp) | Implemented in `main.rs`                             |
-| `pairing::pairing_mode()`                                                       | Reusable NFC pairing helper with BLE fallback                                                  | Implemented, but not called by the current boot path |
-| `pairing::authenticate_bonded_device()`                                         | MAC + active/paired flag check                                                                 | Implemented and tested                               |
-| `pairing::authenticate_with_uid()`                                              | MAC + NFC UID dual-factor check                                                                | Implemented and tested                               |
-| Main loop (inlined)                                                             | Read IMU at 20 Hz + drain MAC update channel + feed `SENSOR_CHANNEL`                           | Implemented (replaces standalone `sensor_loop`)      |
-| `stream_sensor_data_ble()`                                                      | Drain SENSOR_CHANNEL and send BLE notifications                                                | Implemented                                          |
-| `ble_task()`                                                                    | Embassy task: advertise → connect → stream → accept `pairing_mac` write                        | Implemented                                          |
-| `softdevice_task()`                                                             | Embassy task: drive nrf-softdevice S140 event loop                                             | Implemented                                          |
-| `detect_upward_thrust()`                                                        | Motion threshold detection on Z-axis                                                           | Implemented and tested                               |
-| `classify_motion()`                                                             | Classify idle, moderate, intense, or upward thrust                                             | Implemented and tested                               |
-| `validate_sensor_data()`                                                        | Range-check IMU readings                                                                       | Implemented and tested                               |
-
-Remaining firmware gaps:
-
-| Function                   | Purpose                            | Next Step                                           |
-| -------------------------- | ---------------------------------- | --------------------------------------------------- |
-| `animate_led_thrust()`     | WS2812B LED animation              | Implement PWM via `embassy-nrf` on P0.11            |
-| `nfc::write_nfc_page()`    | ISO 14443-3A Type 2 tag page write | Wire through a real NFCT WRITE command in `main.rs` |
-| `get_nfc_pairing_status()` | Live pairing status reporting      | Store and update state instead of returning `Idle`  |
-
-### Unit Tests
-
-Desktop tests verify core logic without hardware:
-
-- `SensorData` size, alignment, creation, cloning, equality, and `to_bytes`/`from_bytes` round-trip
-- Thrust threshold boundaries
-- Motion classification (Idle, Moderate, Intense, UpwardThrust) and priority ordering
-- Sensor validation edge cases and boundary conditions
-- Configuration constants: `THRUST_THRESHOLD`, `NFC_PAIRING_TIMEOUT_SECS`, and `SENSOR_SAMPLING_INTERVAL_MS`
-- `BondedDevice` `to_bytes`/`from_bytes`, flag clear-capable setters, and timestamp
-- `BondedDevice` struct size (serialised vs in-memory)
-- `NfcPairingStatus` and `NfcFieldState` variant coverage (requires `--features nfc`)
-- `BondedDeviceFull` (MAC + UID) serialisation round-trip and UID byte offset
-- NFC UID validation (`is_valid_uid`, `is_valid_uid_7`)
-- Flash record format: `make_flash_record`/`parse_flash_record` round-trip, magic corruption, inactive slot
-- Flash storage constants and page-fit assertion for `MAX_BONDED_DEVICES`
-- `authenticate_bonded_device` with matching and mismatched MACs
-- `authenticate_with_uid` with correct and wrong MAC/UID combinations
-- Pairing CRUD helper contracts, including host-side simulated flash results
-- `get_bonded_devices` and `is_bonded_device` lookups
-- `BleConfig` default values, interval calculation, `bonded_only()` whitelist constructor
-
-Run all tests (no NFC types):
-
-```bash
-cargo test --test integration_test
-```
-
-Run with NFC types included:
-
-```bash
-cargo test --test integration_test --features nfc
-```
-
-The base run covers **34 tests**. Adding `--features nfc` runs **122 tests** (34 base + 88 NFC/pairing/BLE/MAC-update). Both run on the host target with no target specification required.
-
-Additional NFC-gated test modules added since last update:
-
-- `nfc_uid_tests` — `extract_uid_from_nfct` / `parse_nfct_uid` for 4/7/10-byte inputs, cascade-byte validation
-- `flash_address_tests` — page-alignment, softdevice-boundary, and 1-MB flash-boundary assertions for storage constants
-- `ble_whitelist_tests` — `BleConfig` custom interval, distinctness for different MACs
-- `nfc_state_tests` — host-side `get_field_state()` stub behaviour
-- `pairing_mac_tests` — placeholder→real MAC flash record replacement, 6-byte `pairing_mac` value record generation
-
-### LED Animation: Motion-Triggered Flash
-
-The sword blade features real-time LED animations driven by the accelerometer.
-
-```rust
-fn detect_upward_thrust(accel_z: i16) -> bool {
-    accel_z > THRUST_THRESHOLD
-}
-
-fn animate_thrust_effect(led_strip: &mut LedStrip, duration_ms: u32) {
-    for phase in 0..NUM_LEDS {
-        for led_idx in 0..NUM_LEDS {
-            let brightness = if led_idx <= phase {
-                255 * (1.0 - (led_idx as f32 / NUM_LEDS as f32))
-            } else {
-                0
-            };
-
-            led_strip.set_led(led_idx, color_from_brightness(brightness));
-        }
-
-        Timer::after_millis(20).await;
-    }
-}
-```
-
-Animation behavior:
-
-| Motion Type    | LED Pattern                                 | Duration   |
-| -------------- | ------------------------------------------- | ---------- |
-| Upward thrust  | Flash propagates guard to tip in white/blue | 200 ms     |
-| Downward slash | Reverse wave or red/orange pulse fade       | 150 ms     |
-| Impact hit     | Bright white flash then decay               | 100 ms     |
-| Idle/breathing | Slow pulse or dim glow                      | Continuous |
-| Motion stop    | Fade to off over 1 second                   | 1000 ms    |
-
-Performance constraints:
-
-- LED update rate: 50 Hz, 20 ms per frame
-- Sensor data rate: 20 Hz, 50 ms per sample
-- Latency target: under 100 ms from motion to LED update
-- LED strip power budget: approximately 100-500 mA, external supply recommended
-
-## 3. Mobile App: Flutter (Dart) - Planned
-
-### Workflow
-
-1. NFC pairing: tap sword to phone to establish bond
-2. Scan for "He-man Power Sword"
-3. Connect through BLE only if paired MAC matches
-4. Subscribe to sensor characteristic at 20 Hz
-5. Receive 12-byte packets: `accel_x`, `accel_y`, `accel_z`, `gyro_x`, `gyro_y`, `gyro_z`
-6. Analyze motion in real time
-7. Optionally send LED feedback to the device
-8. Visualize sword trajectory in 3D
-
-### Data Packet Format
-
-```text
-┌───────────────────────────────────────────────────┐
-│ BLE Notification, 12 bytes                        │
-├───────────┬───────────┬───────────────────────────┤
-│ Accel X   │ Accel Y   │ Accel Z + Gyro X/Y/Z      │
-│ i16       │ i16       │ 4 x i16                   │
-├───────────┴───────────┴───────────────────────────┤
-│ Frequency: 20 Hz, approximately 50 ms per packet  │
-└───────────────────────────────────────────────────┘
-```
-
-### Sensor Fusion and Visualization
-
-| Algorithm            | Purpose                                                                   |
-| -------------------- | ------------------------------------------------------------------------- |
-| Madgwick AHRS        | Combine accelerometer and gyroscope into 3D orientation                   |
-| Complementary filter | Blend low-frequency accelerometer data with high-frequency gyroscope data |
-| Zero-velocity update | Correct drift by detecting stationary periods                             |
-
-Planned packages:
-
-- `flutter_blue` for BLE communication
-- `vector_math` for 3D vector and matrix math
-- `syncfusion_flutter_charts` or `flutter_3d_obj` for visualization
-
-Android permissions:
-
-- `BLUETOOTH`
-- `BLUETOOTH_ADMIN`
-- `ACCESS_FINE_LOCATION`
-
-## 4. Build and Development
-
-### Prerequisites
-
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Add ARM target (required for embedded builds)
+### NFC, registration, and access limitations
+
+“Pairing”/“bond” names here describe an application registration record, **not
+cryptographic BLE pairing or encryption**. No phone UID authentication is
+implemented: NFCT acts as a tag selected by a reader and the UID is the device's
+local tag identity, not the phone's UID. NFC page writes update a **RAM shadow**;
+there is no real NFCT tag-memory read/write service.
+
+The timeout/open-advertising fallback is intentional. A self-reported MAC and
+local UID comparison do not authenticate a central. Whitelist entries currently
+use **RandomStatic** addresses; central private-address resolution and general
+phone compatibility are not supported claims. Connected clients can issue
+control and ownership-changing commands. Do not rely on this design to protect
+secrets or enforce ownership.
+
+## Embedded build, memory, and SWD flashing
+
+```sh
 rustup target add thumbv7em-none-eabihf
-
-# Install Probe-rs for flashing and debugging
-cargo install probe-rs-tools
+rustup component add llvm-tools-preview
+cargo build --locked --release --features embedded --target thumbv7em-none-eabihf
+bash scripts/check-firmware.sh target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword
 ```
 
-**Important**: All embedded build commands must specify the target architecture with `--target thumbv7em-none-eabihf`. Desktop tests run on the host target automatically.
+`.cargo/config.toml` supplies Cortex-M/defmt linker flags; `memory.x` reserves:
 
-### Flashing the nRF-Softdevice S140 (once per device)
+| Region                     | Address range (end exclusive) |
+| -------------------------- | ----------------------------- |
+| S140 flash reservation     | `0x00000000..0x00026000`      |
+| Application flash          | `0x00026000..0x000EF000`      |
+| Retained registration page | `0x000EF000..0x000F0000`      |
+| Application RAM            | `0x20010000..0x20040000`      |
 
-The nRF-Softdevice S140 is a pre-compiled BLE stack from Nordic. It must be flashed to the device **once** before running the application firmware. You only need to repeat this step after a full chip erase.
+The registration page is **not the last flash page** (that starts at `0xFF000`).
+S140 has a conservative **64 KiB RAM reservation** below `0x20010000`;
+its configured stack requirement is checked at boot and still needs a real
+smoke test. The ELF checker verifies vectors, executable entry/content, load
+segments, and reserved-region separation; it cannot prove successful boot.
+Storage uses SoftDevice flash operations, not direct NVMC writes while BLE runs.
+A single-record erase/write is not power-loss atomic or multi-device storage.
 
-1. Download S140 v7.x.x from [Nordic's website](https://www.nordicsemi.com/Products/nRF52840/Compatible-downloads) and unzip.
-2. Erase the chip: `probe-rs erase --chip nRF52840_xxAA --allow-erase-all`
-3. Flash the softdevice: `probe-rs download --verify --binary-format hex --chip nRF52840_xxAA s140_nrf52_7.x.x_softdevice.hex`
+Flashing needs an SWD probe (for example a supported J-Link/CMSIS-DAP), board SWD
+connections and reference voltage/common ground, plus `probe-rs-tools`.
+Install **Nordic S140** separately: locked `nrf-softdevice-s140` bindings
+(`b0ac850`) identify header version **7.0.1**, variant 140. This is v7 API evidence,
+not proof that an arbitrary v7 binary is compatible; confirm the chosen release
+and `0x26000` application origin. A factory USB bootloader alone is not this stack.
 
-After the softdevice is flashed, build and flash the application normally.
+With the compatible S140 already present, program the application ELF:
 
-### Build and Test Commands
-
-```bash
-# Embedded build (requires target specification)
-cargo build --features embedded --target thumbv7em-none-eabihf
-
-# Embedded release build, optimized for size
-cargo build --release --features embedded --target thumbv7em-none-eabihf
-
-# Desktop unit tests (runs on host target automatically)
-cargo test --test integration_test
-
-# Format and lint
-cargo fmt
-cargo clippy
-
-# Fast compile check
-cargo check --features embedded --target thumbv7em-none-eabihf
+```sh
+probe-rs download --chip nRF52840_xxAA --verify target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword
+# Program, reset/run, and attach logging through the configured SWD runner:
+cargo run --locked --release --features embedded --target thumbv7em-none-eabihf
 ```
 
-### Feature Flags
+For initial stack provisioning, obtain the licensed Nordic HEX, then use
+`probe-rs download --chip nRF52840_xxAA --binary-format hex --verify path/to/s140.hex`.
+Do not default to full-chip erase. If recovery/chip erasure is required, it
+**destroys the bootloader, S140, and stored registrations/bonds**; back up what
+is needed and plan restoration first. No flashing procedure here is hardware-verified.
 
-The project uses Cargo features to control which dependencies are included:
+## Hardware checks still required
 
-| Feature    | Purpose                                                                             | Default |
-| ---------- | ----------------------------------------------------------------------------------- | ------- |
-| `embedded` | Enables Embassy runtime, embassy-nrf HAL, defmt, and all hardware-specific deps     | No      |
-| `std`      | Enables standard library support (for testing)                                      | No      |
-| `nfc`      | Enables `nfc` and `pairing` modules on the host target; no embedded hardware needed | No      |
+- Confirm IMU identity, stationary gravity/gyro readings and configured scales.
+- Measure sampling/fusion timing, including delays during flash operations.
+- Exercise BLE reads, subscriptions, commands, queue saturation and reconnects.
+- Check NFC reader selection and timeout/open fallback after separate boots.
+- Verify registration/update/clear across reboot and injected flash failures.
+- Check physical LED direction, terminal frames, MotionStop staying off,
+  logic levels, full-load current and temperature with current limiting.
 
-The `nfc` feature lets you compile and test all NFC types, pairing logic, and bonded-device management on a desktop machine. The `embedded` feature implicitly activates the same modules plus the async embassy-time helpers.
-
-The `embedded` feature includes Embassy runtime, defmt logging, and hardware-specific dependencies. Tests run without this feature to enable standard library support.
-
-### Build Profile
-
-- Optimization: `-O s`
-- LTO: disabled by default
-- Codegen units: 1
-- Target: `thumbv7em-none-eabihf` (must be specified for embedded builds)
-
-### Flashing the Firmware
-
-```bash
-# Build release binary
-cargo build --release --features embedded --target thumbv7em-none-eabihf
-
-# Flash to board using probe-rs
-probe-rs download target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword
-
-# Or use cargo-flash shortcut
-cargo flash --release --features embedded --target thumbv7em-none-eabihf
-```
-
-## 5. Debugging with RTT
-
-The firmware uses `defmt` + RTT for real-time logging. Connect a debugger such as J-Link and use:
-
-```bash
-# Start RTT viewer
-probe-rs rtt
-
-# Or run and view RTT output
-cargo run --release --features embedded
-```
-
-Expected logs include sensor readings and thrust detection events.
-
-## 6. References
-
-- Rust Embedded
-  - [Embassy Framework](https://github.com/embassy-rs/embassy)
-  - [nrf52840-hal](https://github.com/nrf-rs/nrf-hal)
-  - [lsm6ds3tr driver](https://crates.io/crates/lsm6ds3tr)
-- LED Control
-  - [ws2812-spi crate](https://crates.io/crates/ws2812-spi)
-  - [nRF52840 PWM module](https://docs.rs/nrf52840-hal/latest/nrf52840_hal/pwm/index.html)
-  - [smart-leds crate](https://crates.io/crates/smart-leds)
-- NFC and Security
-  - [nRF52840 NFC Type 2 Tag](https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcomp_5_0%2Fnfct_overview.html)
-  - [nrf-softdevice bonding](https://github.com/embassy-rs/nrf-softdevice)
-  - [NFC documentation, ISO/IEC 14443](https://www.nxp.com/docs/en/user-guide/UM10528.pdf)
-- nRF52840
-  - [Datasheet](https://infocenter.nordicsemi.com/pdf/nRF52840_PS_v3.2.pdf)
-  - [NFC NFCT peripheral](https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcomp_5_0%2Fnfct_overview.html)
-- Sensor Fusion
-  - [Madgwick AHRS reference](https://github.com/arduino-libraries/MadgwickAHRS)
-
-## 7. Architecture Decision Records
-
-### ADR-1: NFC as Primary Pairing Gate
-
-- **Decision**: NFC is required for Bluetooth pairing, not just connection
-- **Rationale**: Security and user experience; tap-to-pair is intuitive
-- **Alternative**: QR code or PIN, rejected because they are less natural for a physical device
-
-### ADR-2: LED Animations Driven by Accelerometer
-
-- **Decision**: Real-time motion detection drives LED flash effects
-- **Rationale**: Immediate feedback without phone latency
-- **Alternative**: Phone-only control, rejected because it adds too much lag
-
-### ADR-3: Bonded Device Whitelist
-
-- **Decision**: Only paired MAC address can connect after pairing
-- **Rationale**: Prevents accidental connection from other devices
-- **Alternative**: Require PIN each time, rejected because it has poor UX
-
-## License
-
-[MIT](./LICENSE)
+No simulator was added. [Wokwi's supported hardware](https://docs.wokwi.com/getting-started/supported-hardware)
+does not include this nRF52840 target; a different-MCU LED demo would not validate
+NFCT, S140, flash mapping or board wiring. Prefer deterministic host tests, then
+the real-board checks above.
