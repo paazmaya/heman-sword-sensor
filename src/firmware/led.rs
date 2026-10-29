@@ -30,7 +30,7 @@ pub(crate) async fn led_task(
     let mut engine = LedEngine::new();
     let mut pwm_words = [0u16; PWM_BUFFER_WORDS];
 
-    info!("💡 WS2812B LED engine initialised on P0.02 (60 LEDs @ 50 Hz)");
+    info!("💡 WS2812B LED engine initialised on P0.02 (129 pixels @ 50 Hz)");
 
     loop {
         // Drain any pending LED commands before rendering the next frame
@@ -61,7 +61,7 @@ pub(crate) async fn led_task(
                 warn!("PWM sequence start failed");
             }
             // Wait for the 20 ms frame interval (50 Hz update rate).
-            // The 1480-word DMA transfer completes in ~1.85 ms, well within 20 ms.
+            // The 3136-word DMA transfer completes in ~3.9 ms, well within 20 ms.
             Timer::after_millis(LED_FRAME_INTERVAL_MS as u64).await;
         }
     }

@@ -1,21 +1,65 @@
 mod led_engine_tests {
     use xiao_nrf52840_sword::led::{
         encode_ws2812_pwm, LedAnimation, LedControlMode, LedEngine, RgbColor, BITS_PER_LED,
-        DURATION_IMPACT_MS, DURATION_MOTION_STOP_MS, DURATION_SLASH_MS, DURATION_THRUST_MS,
-        LED_FRAME_INTERVAL_MS, NUM_LEDS, PWM_BUFFER_WORDS, PWM_POLARITY_BIT, PWM_RESET_WORD,
-        PWM_T0H_WORD, PWM_T1H_WORD, RESET_SLOTS,
+        BLADE_SIDE_LEDS, DURATION_IMPACT_MS, DURATION_MOTION_STOP_MS, DURATION_SLASH_MS,
+        DURATION_THRUST_MS, LED_FRAME_INTERVAL_MS, NUM_LEDS, PWM_BUFFER_WORDS, PWM_POLARITY_BIT,
+        PWM_RESET_WORD, PWM_T0H_WORD, PWM_T1H_WORD, RESET_SLOTS, TIP_LEDS, TIP_START, WHITE_CAP,
     };
     use xiao_nrf52840_sword::{
         detect_sword_gesture, detect_sword_gesture_with_thresholds, SensorData, IMPACT_THRESHOLD,
         THRUST_THRESHOLD,
     };
 
+    fn tip_pixels(frame: &[RgbColor; NUM_LEDS]) -> &[RgbColor] {
+        &frame[TIP_START..TIP_START + TIP_LEDS]
+    }
+
     #[test]
-    fn test_led_strip_constants_for_60_leds() {
-        assert_eq!(NUM_LEDS, 60);
+    fn test_led_strip_constants_for_folded_strip_and_tip_module() {
+        assert_eq!(BLADE_SIDE_LEDS, 63);
+        assert_eq!(TIP_LEDS, 3);
+        assert_eq!(NUM_LEDS, 63 + 3 + 63);
+        assert_eq!(TIP_START, 63);
         assert_eq!(LED_FRAME_INTERVAL_MS, 20); // 50 Hz
-        assert_eq!(PWM_BUFFER_WORDS, 60 * 24 + 40);
-        assert_eq!(PWM_BUFFER_WORDS, 1480);
+        assert_eq!(PWM_BUFFER_WORDS, 129 * 24 + 40);
+        assert_eq!(PWM_BUFFER_WORDS, 3136);
+    }
+
+    #[test]
+    fn test_white_cap_limits_white_but_keeps_saturated_colors() {
+        assert_eq!(
+            RgbColor::WHITE.limit_white(WHITE_CAP),
+            RgbColor::new(WHITE_CAP, WHITE_CAP, WHITE_CAP)
+        );
+        // White component is capped, the colored part is kept: (80, 180, 255) has min 80 <= cap.
+        assert_eq!(
+            RgbColor::GRAYSKULL_BLUE.limit_white(WHITE_CAP),
+            RgbColor::GRAYSKULL_BLUE
+        );
+        assert_eq!(
+            RgbColor::new(200, 150, 100).limit_white(WHITE_CAP),
+            RgbColor::new(185, 135, 85)
+        );
+        assert_eq!(
+            RgbColor::SLASH_ORANGE.limit_white(WHITE_CAP),
+            RgbColor::SLASH_ORANGE
+        );
+        assert_eq!(RgbColor::BLACK.limit_white(WHITE_CAP), RgbColor::BLACK);
+    }
+
+    #[test]
+    fn test_encode_caps_white_pixels() {
+        let mut leds = [RgbColor::BLACK; NUM_LEDS];
+        leds[0] = RgbColor::WHITE;
+        let mut capped = [0u16; PWM_BUFFER_WORDS];
+        encode_ws2812_pwm(&leds, 255, &mut capped);
+
+        let mut expected_leds = [RgbColor::BLACK; NUM_LEDS];
+        expected_leds[0] = RgbColor::new(WHITE_CAP, WHITE_CAP, WHITE_CAP);
+        let mut expected = [0u16; PWM_BUFFER_WORDS];
+        encode_ws2812_pwm(&expected_leds, 255, &mut expected);
+        assert_eq!(capped, expected);
+        assert_ne!(capped[0..24], [PWM_T1H_WORD; 24]);
     }
 
     #[test]
@@ -55,9 +99,11 @@ mod led_engine_tests {
         assert_eq!(engine.control_mode(), LedControlMode::AutoMotion);
         assert_eq!(engine.brightness(), 255);
         let frame = engine.tick(20);
-        assert_eq!(frame.len(), 60);
-        // Idle breathing produces a non-black dim blue/cyan glow
+        assert_eq!(frame.len(), NUM_LEDS);
+        // Idle breathing produces a non-black dim blue/cyan glow on the blade, tip module off
         assert!(frame[0].b > 0);
+        assert!(frame[NUM_LEDS - 1].b > 0);
+        assert!(tip_pixels(&frame).iter().all(|p| *p == RgbColor::BLACK));
     }
 
     #[test]
@@ -65,18 +111,27 @@ mod led_engine_tests {
         let mut engine = LedEngine::new();
         engine.trigger_motion(LedAnimation::UpwardThrust);
         assert_eq!(engine.current_animation(), LedAnimation::UpwardThrust);
+        let tip_end_up = BLADE_SIDE_LEDS - 1;
+        let tip_end_down = NUM_LEDS - BLADE_SIDE_LEDS;
 
-        // Frame 0 (t = 0 ms): guard LED (0) is lit, tip LED (59) is still dark
+        // Frame 0 (t = 0 ms): guard pixels are lit on both sides, tip end and tip module are dark
         let frame_start = engine.tick(50);
         assert_ne!(frame_start[0], RgbColor::BLACK);
-        assert_eq!(frame_start[NUM_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(frame_start[NUM_LEDS - 1], RgbColor::BLACK);
+        assert_eq!(frame_start[tip_end_up], RgbColor::BLACK);
+        assert_eq!(frame_start[tip_end_down], RgbColor::BLACK);
+        assert!(tip_pixels(&frame_start)
+            .iter()
+            .all(|p| *p == RgbColor::BLACK));
 
-        // Advance to end of thrust (t = 200 ms): tip LED (59) is now lit
+        // Advance to end of thrust (t = 200 ms): blade tip and tip module are fully lit
         let _ = engine.tick(50); // t=50
         let _ = engine.tick(50); // t=100
         let _ = engine.tick(50); // t=150
         let frame_end = engine.tick(20); // t=200 (duration limit)
-        assert_ne!(frame_end[NUM_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(frame_end[tip_end_up], RgbColor::BLACK);
+        assert_ne!(frame_end[tip_end_down], RgbColor::BLACK);
+        assert!(tip_pixels(&frame_end).iter().all(|p| *p == RgbColor::WHITE));
 
         // Next tick after duration elapses transitions back to IdleBreathing
         assert_eq!(DURATION_THRUST_MS, 200);
@@ -85,21 +140,35 @@ mod led_engine_tests {
     }
 
     #[test]
+    fn test_upward_thrust_tip_module_ramps_up_during_beam() {
+        let mut engine = LedEngine::new();
+        engine.trigger_motion(LedAnimation::UpwardThrust);
+        let _ = engine.tick(100);
+        let mid = engine.tick(100);
+        let mid_tip = tip_pixels(&mid)[0];
+        assert!(mid_tip != RgbColor::BLACK && mid_tip != RgbColor::WHITE);
+    }
+
+    #[test]
     fn test_downward_slash_propagates_tip_to_guard() {
         let mut engine = LedEngine::new();
         engine.trigger_motion(LedAnimation::DownwardSlash);
         assert_eq!(engine.current_animation(), LedAnimation::DownwardSlash);
 
-        // Frame 0 (t = 0 ms): tip LED (59) is lit, guard LED (0) is dark
+        // Frame 0 (t = 0 ms): tip end is lit on both sides, guard and tip module are dark
         let frame0 = engine.tick(50);
-        assert_ne!(frame0[NUM_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(frame0[BLADE_SIDE_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(frame0[NUM_LEDS - BLADE_SIDE_LEDS], RgbColor::BLACK);
         assert_eq!(frame0[0], RgbColor::BLACK);
+        assert_eq!(frame0[NUM_LEDS - 1], RgbColor::BLACK);
+        assert!(tip_pixels(&frame0).iter().all(|p| *p == RgbColor::BLACK));
 
-        // Advance to end of 150 ms slash: guard LED (0) is lit
+        // Advance to end of 150 ms slash: guard pixels are lit
         let _ = engine.tick(50);
         let _ = engine.tick(50);
         let frame_end = engine.tick(20); // t=150 ms
         assert_ne!(frame_end[0], RgbColor::BLACK);
+        assert_ne!(frame_end[NUM_LEDS - 1], RgbColor::BLACK);
         assert_eq!(DURATION_SLASH_MS, 150);
     }
 
@@ -148,7 +217,8 @@ mod led_engine_tests {
         let _ = engine.tick(1);
         let _ = engine.tick(u32::MAX);
         let endpoint = engine.tick(0);
-        assert_ne!(endpoint[NUM_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(endpoint[BLADE_SIDE_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(endpoint[TIP_START], RgbColor::BLACK);
         assert_eq!(engine.current_animation(), LedAnimation::IdleBreathing);
     }
 
@@ -161,7 +231,8 @@ mod led_engine_tests {
         let frame = engine.tick(100);
         assert_ne!(frame[29], RgbColor::BLACK);
         let terminal = engine.tick(0);
-        assert_ne!(terminal[NUM_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(terminal[BLADE_SIDE_LEDS - 1], RgbColor::BLACK);
+        assert_ne!(terminal[TIP_START], RgbColor::BLACK);
         assert_eq!(engine.current_animation(), LedAnimation::IdleBreathing);
     }
 
@@ -177,7 +248,8 @@ mod led_engine_tests {
         assert_eq!(engine.current_animation(), LedAnimation::SolidColor(purple));
         let frame = engine.tick(20);
         assert_eq!(frame[0], purple);
-        assert_eq!(frame[59], purple);
+        assert_eq!(frame[NUM_LEDS - 1], purple);
+        assert!(tip_pixels(&frame).iter().all(|p| *p == purple));
     }
 
     #[test]
