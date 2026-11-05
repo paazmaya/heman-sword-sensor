@@ -2,6 +2,14 @@
 name = "xiao_nrf52840_sword"
 version = "0.1.0"
 edition = "2021"
+description = "Rust firmware for Seeed XIAO nRF52840 Sense sword prop with motion sensing, BLE, and WS2812B LEDs"
+license = "MIT"
+authors = ["Juga Paazmaya <paazmaya@yahoo.com>"]
+homepage = "https://github.com/paazmaya/heman-sword-sensor"
+repository = "https://github.com/paazmaya/heman-sword-sensor"
+keywords = ["nrf52840", "embedded", "ble", "ws2812b", "imu"]
+categories = ["embedded", "no-std"]
+publish = false
 
 [features]
 default = []
