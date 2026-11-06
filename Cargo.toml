@@ -2,6 +2,7 @@
 name = "xiao_nrf52840_sword"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Rust firmware for Seeed XIAO nRF52840 Sense sword prop with motion sensing, BLE, and WS2812B LEDs"
 license = "MIT"
 authors = ["Juga Paazmaya <paazmaya@yahoo.com>"]
