@@ -1,5 +1,8 @@
 # He-Man Sword Sensor
 
+[![Rust CI](https://github.com/paazmaya/heman-sword-sensor/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/paazmaya/heman-sword-sensor/actions/workflows/rust-ci.yml)
+[![codecov](https://codecov.io/gh/paazmaya/heman-sword-sensor/graph/badge.svg)](https://codecov.io/gh/paazmaya/heman-sword-sensor)
+
 Rust firmware for a **Seeed XIAO nRF52840 Sense** prop: onboard LSM6DS3TR
 motion sensing, relative orientation over BLE, and a 129-pixel WS2812B blade
 (2.1 m of 60 LEDs/m folded at the tip, plus a 3-pixel tip module).
