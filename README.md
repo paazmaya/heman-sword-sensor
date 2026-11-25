@@ -140,15 +140,16 @@ white) and full-strip effects (impact, solid color). The constants are in
              │                      │
         A DIN (guard)          B DOUT (guard)
              ▲                      ✗ leave unconnected
-   data: D0 → level shifter → 330 Ω
+   data: D0 → level shifter → 390 Ω
 ```
 
 - **Data** enters at one point only: strip A's DIN at the guard. A DOUT feeds the
   tip module DIN, the module DOUT feeds strip B's DIN at the tip. Strip B's DOUT
   at the guard stays unconnected.
 - **Power** (5 V and GND from the LED rail) is injected at both guard ends, with
-  the 1000 µF capacitor. At the tip the module's 5 V and GND are joined to both
-  strips' 5 V and GND, so power runs through the tip as well as the data.
+  about 990 µF of bulk capacitance (3 × 330 µF in parallel). At the tip the
+  module's 5 V and GND are joined to both strips' 5 V and GND, so power runs
+  through the tip as well as the data.
 - **Cut** the 2.1 m strip once, at a cut line after the 63rd pixel (about
   1.05 m), and check the printed arrows on each piece before soldering: strip B
   must receive data at the tip end.
@@ -228,8 +229,16 @@ so strip current spikes or an output trip cannot brown out the controller.
   amps. Use a USB plug-to-bare-wire pigtail for the LED rail with heavy (about
   AWG 18–20), short leads, with a fuse of about 3–4 A in the +5 V lead. A USB-C
   pigtail needs the CC pull-down resistors from a proper breakout; a USB-A
-  plug is simpler. Add a 1000 µF capacitor across the strip supply at the
-  strip, next to the tip module and each feed point.
+  plug is simpler. At each point where the LED rail is injected, put a bulk
+  capacitor across +5 V and GND close to the strip/module. The 1000 µF target
+  is at the upper end of Adafruit's 500–1000 µF recommendation for absorbing
+  brief supply transients as brightness changes. If you do not have a single
+  1000 µF part, three 330 µF capacitors in parallel give 990 µF nominal, close
+  enough (and within ordinary capacitor tolerance). Observe electrolytic
+  polarity and use parts rated for at least 6.3 V; 10 V or higher gives more
+  voltage margin. These capacitors are local transient buffering, not a
+  substitute for a supply, wiring, or fuse rated for the strip's current.
+  See [Adafruit's NeoPixel power guidance](https://learn.adafruit.com/adafruit-neopixel-uberguide/powering-neopixels).
 - **Switch.** Use a two-pole on/off switch that opens the +5 V leads of both
   feeds together, so the controller never drives the data line of an unpowered
   strip. A single-pole switch in the LED rail alone is acceptable only if the
@@ -253,9 +262,29 @@ so strip current spikes or an output trip cannot brown out the controller.
 
 - Use a suitable 3.3 V-to-strip-data **level shifter** (for example 74AHCT125)
   with its high-side supply on the LED rail and low-side supply on the XIAO 3V3
-  pin, plus a series resistor of about 330 Ω on the data line. At 5 V the
-  WS2812B needs ≥ 0.7 × VDD (about 3.5 V) for a high, so the 3.3 V output
-  alone is not enough. Keep the data wire short and run it with its ground.
+  pin, plus a 390 Ω series resistor close to the first pixel's DIN. This value
+  is within the recommended 300–500 Ω range and helps damp cable ringing and
+  limit brief input spikes; 330 Ω would also be suitable. At 5 V the WS2812B
+  needs ≥ 0.7 × VDD (about 3.5 V) for a high, so the 3.3 V output alone is not
+  enough. Keep the data wire short and run it with its ground. See
+  [Adafruit's NeoPixel wiring guidance](https://learn.adafruit.com/adafruit-neopixel-uberguide/best-practices).
+
+```text
+XIAO D0 ──> level shifter ──> 390 Ω ──> first pixel DIN
+                 (common GND with LED supply)
+
+LED +5 V ──┬────────┬────────┬──> strip/module +5 V
+           │        │        │
+         (+)      (+)      (+)
+        330 µF   330 µF   330 µF    electrolytic, each ≥6.3 V
+         (−)      (−)      (−)
+           │        │        │
+LED GND ───┴────────┴────────┴──> strip/module GND
+```
+
+The three capacitors are wired **in parallel** at the LED power-injection
+point: all positive leads to +5 V and all negative leads to GND. Their nominal
+total is 990 µF. Place them near the strip/module power entry.
 
 ### Mechanical safety
 
