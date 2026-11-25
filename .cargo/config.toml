@@ -1,7 +1,3 @@
 # Configure embedded target for ARM Cortex-M builds
-[target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = "probe-rs run --chip nRF52840_xxAA"
-
 [target.thumbv7em-none-eabihf]
-runner = "probe-rs run --chip nRF52840_xxAA"
 rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x", "-C", "link-arg=-Tdefmt.x"]

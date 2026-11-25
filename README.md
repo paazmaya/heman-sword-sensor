@@ -236,7 +236,8 @@ so strip current spikes or an output trip cannot brown out the controller.
   level shifter is powered from the same switched rail.
 - **Do not combine sources.** Do not power the XIAO from the bank and from a
   computer's USB at the same time; unplug the bank feed before connecting USB
-  for programming or logging. SWD flashing still needs its own probe wiring.
+  for programming or logging. USB UF2 flashing uses the board's USB-C connector;
+  SWD remains optional for recovery and RTT logging.
 - **Capacity and size.** 16800 mAh is normally rated at the cell voltage
   (about 3.7 V, roughly 62 Wh); even if it were rated at 5 V it would be about
   84 Wh. Both are under the 100 Wh that most airlines allow in carry-on baggage
@@ -350,7 +351,7 @@ phone compatibility are not supported claims. Connected clients can issue
 control and ownership-changing commands. Do not rely on this design to protect
 secrets or enforce ownership.
 
-## Embedded build, memory, and SWD flashing
+## Embedded build, memory, and USB flashing
 
 ```sh
 rustup target add thumbv7em-none-eabihf
@@ -361,12 +362,46 @@ bash scripts/check-firmware.sh target/thumbv7em-none-eabihf/release/xiao_nrf5284
 
 `.cargo/config.toml` supplies Cortex-M/defmt linker flags; `memory.x` reserves:
 
-| Region                     | Address range (end exclusive) |
-| -------------------------- | ----------------------------- |
-| S140 flash reservation     | `0x00000000..0x00026000`      |
-| Application flash          | `0x00026000..0x000EF000`      |
-| Retained registration page | `0x000EF000..0x000F0000`      |
-| Application RAM            | `0x20010000..0x20040000`      |
+| Region                       | Address range (end exclusive) |
+| ---------------------------- | ----------------------------- |
+| S140 flash reservation       | `0x00000000..0x00027000`      |
+| Application flash            | `0x00027000..0x000ED000`      |
+| Seeed bootloader reservation | `0x000ED000..0x000EF000`      |
+| Retained registration page   | `0x000EF000..0x000F0000`      |
+| Application RAM              | `0x20010000..0x20040000`      |
+
+The app starts at `0x27000` to match the Seeed XIAO nRF52840 Sense USB
+bootloader's S140 7.3.0 layout. The pinned `nrf-softdevice-s140` bindings use
+S140 7.0.1 headers from the same API major version. USB flashing assumes the
+factory bootloader and its compatible S140 are intact; UF2 updates only the
+application, not the bootloader or SoftDevice.
+
+After building and checking the ELF, connect the board with a data-capable USB-C
+cable. Quickly press and release the reset button twice (within about
+500 milliseconds) to enter UF2 mode; do not hold the button down. macOS should
+mount the bootloader as a volume, usually named `XIAO-SENSE`. Find the actual
+mount point and verify it contains the bootloader information file:
+
+```sh
+ls -1 /Volumes
+find /Volumes -maxdepth 2 -name INFO_UF2.TXT -print
+```
+
+Use the volume path containing `INFO_UF2.TXT` (the parent directory of the
+printed path) when flashing. For example:
+
+```sh
+bash scripts/flash-usb.sh target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword "/Volumes/XIAO-SENSE"
+```
+
+The script converts the ELF to Intel HEX and then to an nRF52840 UF2 image,
+checks the selected volume's `INFO_UF2.TXT`, and streams the image bytes to
+`NEW.UF2` without asking macOS to copy extended attributes. Wait for the board
+to restart after the write. If the UF2 volume does not appear,
+or the bootloader/SoftDevice has been erased or replaced, USB application
+flashing is unavailable until a compatible stack and bootloader are restored
+over SWD using a supported probe. SWD is also needed to inspect RTT logs emitted
+by `defmt-rtt`.
 
 The registration page is **not the last flash page** (that starts at `0xFF000`).
 S140 has a conservative **64 KiB RAM reservation** below `0x20010000`;
@@ -375,39 +410,7 @@ smoke test. The ELF checker verifies vectors, executable entry/content, load
 segments, and reserved-region separation; it cannot prove successful boot.
 Storage uses SoftDevice flash operations, not direct NVMC writes while BLE runs.
 A single-record erase/write is not power-loss atomic or multi-device storage.
-
-Install `probe-rs-tools` before flashing or using the configured `cargo run`
-SWD runner:
-
-```sh
-cargo install probe-rs-tools --locked
-probe-rs --version # Something like: probe-rs 0.32.0 (git commit: 48f5e4d)
-```
-
-This installs `probe-rs`, `cargo-flash`, and `cargo-embed`. See the
-[probe-rs installation guide](https://probe.rs/docs/getting-started/installation/)
-for other installation options.
-
-Flashing needs an SWD probe (for example a supported J-Link/CMSIS-DAP), board SWD
-connections and reference voltage/common ground.
-Install **Nordic S140** separately: locked `nrf-softdevice-s140` bindings
-(`b0ac850`) identify header version **7.0.1**, variant 140. This is v7 API evidence,
-not proof that an arbitrary v7 binary is compatible; confirm the chosen release
-and `0x26000` application origin. A factory USB bootloader alone is not this stack.
-
-With the compatible S140 already present, program the application ELF:
-
-```sh
-probe-rs download --chip nRF52840_xxAA --verify target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword
-# Program, reset/run, and attach logging through the configured SWD runner:
-cargo run --locked --release --features embedded --target thumbv7em-none-eabihf
-```
-
-For initial stack provisioning, obtain the licensed Nordic HEX, then use
-`probe-rs download --chip nRF52840_xxAA --binary-format hex --verify path/to/s140.hex`.
-Do not default to full-chip erase. If recovery/chip erasure is required, it
-**destroys the bootloader, S140, and stored registrations/bonds**; back up what
-is needed and plan restoration first. No flashing procedure here is hardware-verified.
+No USB flashing procedure here has been hardware-verified.
 
 ## Hardware checks still required
 
