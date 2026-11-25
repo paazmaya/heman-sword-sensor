@@ -119,6 +119,8 @@ do not repurpose them for the strip. Follow Seeed's
 [Sense board pin mapping](https://github.com/Seeed-Studio/Adafruit_nRF52_Arduino/blob/master/variants/Seeed_XIAO_nRF52840_Sense/variant.cpp)
 and antenna guidance, not generic nRF52840 pin diagrams.
 
+![XIAO nRF52840 Sense front pinout](./XIAO_nRF52840_Sense_front_pinout.png)
+
 The 129-pixel data chain on D0 is ordered guard → tip (pixels `0..63`), the
 3-pixel tip module (`63..66`), then tip → guard (`66..129`). Cut the 2.1 m strip
 after its 63rd pixel and splice the tip module in: 5 V and GND continuous, strip
@@ -374,8 +376,20 @@ segments, and reserved-region separation; it cannot prove successful boot.
 Storage uses SoftDevice flash operations, not direct NVMC writes while BLE runs.
 A single-record erase/write is not power-loss atomic or multi-device storage.
 
+Install `probe-rs-tools` before flashing or using the configured `cargo run`
+SWD runner:
+
+```sh
+cargo install probe-rs-tools --locked
+probe-rs --version # Something like: probe-rs 0.32.0 (git commit: 48f5e4d)
+```
+
+This installs `probe-rs`, `cargo-flash`, and `cargo-embed`. See the
+[probe-rs installation guide](https://probe.rs/docs/getting-started/installation/)
+for other installation options.
+
 Flashing needs an SWD probe (for example a supported J-Link/CMSIS-DAP), board SWD
-connections and reference voltage/common ground, plus `probe-rs-tools`.
+connections and reference voltage/common ground.
 Install **Nordic S140** separately: locked `nrf-softdevice-s140` bindings
 (`b0ac850`) identify header version **7.0.1**, variant 140. This is v7 API evidence,
 not proof that an arbitrary v7 binary is compatible; confirm the chosen release

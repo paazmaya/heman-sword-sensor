@@ -10,6 +10,9 @@ fail() {
 image="${1:-target/thumbv7em-none-eabihf/release/xiao_nrf52840_sword}"
 host=$(rustc -vV | sed -n 's/^host: //p')
 tools="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+for tool in llvm-readobj llvm-objdump llvm-nm llvm-size; do
+  [[ -x "$tools/$tool" ]] || fail "missing $tools/$tool; install the active toolchain component with: rustup component add llvm-tools-preview"
+done
 entry=$("$tools/llvm-readobj" --file-headers "$image" | awk '/Entry:/ {print $2}')
 if [[ -z "$entry" ]] || ! (( entry >= 0x26001 && entry < 0xEF000 && (entry & 1) == 1 )); then
   echo "Invalid firmware entry point: $entry" >&2
